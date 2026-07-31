@@ -19,7 +19,11 @@ const MAX_JSON_NODES = 12_000;
 const MAX_JSON_DEPTH = 35;
 const MAX_MEDIA_ITEMS = 10;
 
-type JsonObject = Record<string, unknown>;
+export type JsonObject = Record<string, unknown>;
+
+export interface ParseSocialPostOptions {
+	fetchVideos?: boolean;
+}
 
 function isObject(value: unknown): value is JsonObject {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -115,7 +119,7 @@ function bestCandidateUrl(value: unknown): string {
 	return asString(candidates[0]?.url);
 }
 
-function collectMediaFromObject(
+export function collectMediaFromObject(
 	object: JsonObject,
 	add: (url: string, type: "image" | "video") => void,
 ): void {
@@ -125,21 +129,27 @@ function collectMediaFromObject(
 			const item = asObject(rawItem);
 			if (!item) continue;
 			const video = bestCandidateUrl(item.video_versions);
-			if (video) add(video, "video");
-			const image = bestCandidateUrl(
-				getPath(item, "image_versions2", "candidates"),
-			);
-			if (image) add(image, "image");
+			if (video) {
+				add(video, "video");
+			} else {
+				const image = bestCandidateUrl(
+					getPath(item, "image_versions2", "candidates"),
+				);
+				if (image) add(image, "image");
+			}
 		}
 		return;
 	}
 
 	const video = bestCandidateUrl(object.video_versions);
-	if (video) add(video, "video");
-	const image = bestCandidateUrl(
-		getPath(object, "image_versions2", "candidates"),
-	);
-	if (image) add(image, "image");
+	if (video) {
+		add(video, "video");
+	} else {
+		const image = bestCandidateUrl(
+			getPath(object, "image_versions2", "candidates"),
+		);
+		if (image) add(image, "image");
+	}
 }
 
 function walkJson(
@@ -186,20 +196,39 @@ function walkJson(
 }
 
 function scorePostObject(object: JsonObject, id: string): number {
-	let score = 0;
 	const objectId =
 		asString(object.code) ||
 		asString(object.shortcode) ||
 		asString(object.pk) ||
 		asString(object.id);
-	if (objectId === id || objectId.startsWith(`${id}_`)) score += 100;
+	const matchesId = objectId === id || objectId.startsWith(`${id}_`);
+	if (!matchesId) return 0;
+
+	let score = 100;
+	let contentSignals = 0;
 	if (asString(getPath(object, "caption", "text"))) score += 20;
-	if (asString(getPath(object, "user", "username"))) score += 10;
-	if (asArray(object.carousel_media).length > 0) score += 10;
-	if (asArray(getPath(object, "image_versions2", "candidates")).length > 0)
+	if (asString(getPath(object, "caption", "text"))) contentSignals += 1;
+	if (
+		asString(getPath(object, "user", "username")) ||
+		asString(getPath(object, "owner", "username")) ||
+		asString(object.username)
+	) {
+		score += 10;
+		contentSignals += 1;
+	}
+	if (asArray(object.carousel_media).length > 0) {
+		score += 10;
+		contentSignals += 1;
+	}
+	if (asArray(getPath(object, "image_versions2", "candidates")).length > 0) {
 		score += 5;
-	if (asArray(object.video_versions).length > 0) score += 5;
-	return score;
+		contentSignals += 1;
+	}
+	if (asArray(object.video_versions).length > 0) {
+		score += 5;
+		contentSignals += 1;
+	}
+	return contentSignals > 0 ? score : 1;
 }
 
 function extractTimestamp(object: JsonObject): string | undefined {
@@ -237,7 +266,84 @@ function cleanDescription(value: string, platform: SocialPlatform): string {
 	return content;
 }
 
-function authorFromMeta(
+export function extractInstagramUsernameFromMetaUrl(
+	value: string,
+	expectedId: string,
+): string {
+	try {
+		const url = new URL(value);
+		const hostname = url.hostname.toLowerCase();
+		if (
+			url.protocol !== "https:" ||
+			!["instagram.com", "www.instagram.com"].includes(hostname)
+		) {
+			return "";
+		}
+		const segments = url.pathname.split("/").filter(Boolean);
+		if (
+			segments.length >= 3 &&
+			["p", "reel", "reels", "tv"].includes(segments[1]) &&
+			segments[2] === expectedId &&
+			/^[A-Za-z0-9._]+$/.test(segments[0])
+		) {
+			return segments[0];
+		}
+	} catch {
+		// Invalid metadata URL.
+	}
+	return "";
+}
+
+export function extractInstagramEmbedVideoUrls(html: string): string[] {
+	const urls: string[] = [];
+	const seen = new Set<string>();
+	const addDecodedUrl = (decoded: unknown): void => {
+		if (typeof decoded !== "string") return;
+		const valid = validateMediaUrl(decoded);
+		if (!valid) return;
+		const normalized = valid.toString();
+		if (seen.has(normalized)) return;
+		seen.add(normalized);
+		urls.push(normalized);
+	};
+	const directPattern = /"video_url":("(?:\\.|[^"\\])*")/g;
+	let directMatch: RegExpExecArray | null;
+	while (
+		urls.length < MAX_MEDIA_ITEMS &&
+		(directMatch = directPattern.exec(html)) !== null
+	) {
+		try {
+			addDecodedUrl(JSON.parse(directMatch[1]) as unknown);
+		} catch {
+			// Ignore malformed ServerJS string literals.
+		}
+	}
+
+	const escapedPattern =
+		/\\"video_url\\":\\"((?:\\\\.|[^"\\])*)\\"/g;
+	let escapedMatch: RegExpExecArray | null;
+	while (
+		urls.length < MAX_MEDIA_ITEMS &&
+		(escapedMatch = escapedPattern.exec(html)) !== null
+	) {
+		let decoded = escapedMatch[1];
+		for (let pass = 0; pass < 2; pass += 1) {
+			try {
+				decoded = JSON.parse(
+					`"${decoded.replace(/"/g, '\\"')}"`,
+				) as string;
+			} catch {
+				decoded = "";
+				break;
+			}
+		}
+		addDecodedUrl(decoded);
+	}
+
+	return urls;
+}
+
+export function authorFromMeta(
 	title: string,
 	description: string,
 	fallbackUsername: string,
@@ -246,11 +352,14 @@ function authorFromMeta(
 		title.match(/\(@([A-Za-z0-9._]+)\)/) ??
 		description.match(/@([A-Za-z0-9._]+)/);
 	const username = usernameMatch?.[1] ?? fallbackUsername;
-	const nameCandidate = title
-		.split(/[•|]/)[0]
-		.replace(/\(@[^)]+\)/, "")
-		.replace(/^@/, "")
-		.trim();
+	const instagramName = title.match(/^(.+?)\s+on Instagram(?::|$)/i)?.[1];
+	const nameCandidate =
+		instagramName?.trim() ||
+		title
+			.split(/[•|]/)[0]
+			.replace(/\(@[^)]+\)/, "")
+			.replace(/^@/, "")
+			.trim();
 	return {
 		name: nameCandidate || username || "Unknown author",
 		username: username || "unknown",
@@ -317,6 +426,7 @@ export async function parseSocialPost(
 	inputUrl: string,
 	sessionCookie?: string,
 	userProvidedUserAgent?: string,
+	options: ParseSocialPostOptions = {},
 ): Promise<SocialPost> {
 	const parsedUrl = parseSupportedSocialUrl(inputUrl);
 	if (!parsedUrl) {
@@ -333,6 +443,7 @@ export async function parseSocialPost(
 		Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 		"Accept-Language": "en-US,en;q=0.9",
 	};
+	const fetchVideos = options.fetchVideos ?? true;
 	const cookie = normalizeSessionCookie(sessionCookie);
 	const requestPage = async (cookieHeader?: string) => {
 		const requestHeaders = { ...headers };
@@ -359,12 +470,10 @@ export async function parseSocialPost(
 	let cookieWasSent = false;
 	const initialDescription =
 		getMeta(doc, "og:description") || getMeta(doc, "twitter:description");
-	const initialImage =
-		getMeta(doc, "og:image") || getMeta(doc, "twitter:image");
 	const initialLooksLoggedOut =
 		/Join Threads to share ideas|Log in with your Instagram/i.test(
 			initialDescription,
-		) || (!initialDescription && !initialImage);
+		) || !initialDescription;
 
 	// Try public access first so the secret is sent only when it is actually
 	// needed. Short/share routes remain cookie-free because they may redirect.
@@ -378,9 +487,13 @@ export async function parseSocialPost(
 		cookieWasSent = true;
 	}
 
-	const title = getMeta(doc, "og:title") || getMeta(doc, "twitter:title");
+	const title =
+		parsedUrl.platform === "instagram"
+			? getMeta(doc, "twitter:title") || getMeta(doc, "og:title")
+			: getMeta(doc, "og:title") || getMeta(doc, "twitter:title");
 	const description =
 		getMeta(doc, "og:description") || getMeta(doc, "twitter:description");
+	const canonicalMetaUrl = getMeta(doc, "og:url");
 	const ogImage = getMeta(doc, "og:image") || getMeta(doc, "twitter:image");
 	const ogVideo =
 		getMeta(doc, "og:video:secure_url") ||
@@ -409,31 +522,46 @@ export async function parseSocialPost(
 		}
 	}
 
-	let bestPost: JsonObject | null = null;
-	let bestScore = 0;
+	const bestMatch: { post: JsonObject | null; score: number } = {
+		post: null,
+		score: 0,
+	};
 	for (const root of jsonRoots) {
 		walkJson(root, (object) => {
 			const score = scorePostObject(object, parsedUrl.id);
-			if (score > bestScore) {
-				bestScore = score;
-				bestPost = object;
+			if (score > bestMatch.score) {
+				bestMatch.score = score;
+				bestMatch.post = object;
 			}
 		});
 	}
 
+	const metaUsername =
+		parsedUrl.platform === "instagram"
+			? extractInstagramUsernameFromMetaUrl(
+					canonicalMetaUrl,
+					parsedUrl.id,
+				)
+			: "";
 	const fallbackAuthor = authorFromMeta(
 		title,
 		description,
-		parsedUrl.username ?? "",
+		metaUsername || parsedUrl.username || "",
 	);
-	const postObject = bestPost as JsonObject | null;
+	const postObject =
+		bestMatch.score >= 100 && bestMatch.post ? bestMatch.post : null;
 	const authorUsername =
 		(postObject
-			? asString(getPath(postObject, "user", "username"))
-			: "") || fallbackAuthor.username;
+			? asString(getPath(postObject, "user", "username")) ||
+				asString(getPath(postObject, "owner", "username")) ||
+				asString(postObject.username)
+			: "") ||
+		metaUsername ||
+		fallbackAuthor.username;
 	const authorName =
 		(postObject
-			? asString(getPath(postObject, "user", "full_name"))
+			? asString(getPath(postObject, "user", "full_name")) ||
+				asString(getPath(postObject, "owner", "full_name"))
 			: "") || fallbackAuthor.name;
 	const content =
 		(postObject
@@ -443,9 +571,54 @@ export async function parseSocialPost(
 		"No text content found in post.";
 
 	const collector = createMediaCollector();
-	if (postObject) collectMediaFromObject(postObject, collector.add);
-	if (ogVideo) collector.add(ogVideo, "video");
-	if (ogImage) collector.add(ogImage, "image");
+	const addRequestedMedia = (
+		url: string,
+		type: "image" | "video",
+	): void => {
+		if (type === "video" && !fetchVideos) return;
+		collector.add(url, type);
+	};
+	if (postObject) collectMediaFromObject(postObject, addRequestedMedia);
+	if (ogVideo && fetchVideos) collector.add(ogVideo, "video");
+
+	if (
+		fetchVideos &&
+		parsedUrl.platform === "instagram" &&
+		parsedUrl.kind === "reel" &&
+		!collector.items.some((item) => item.type === "video")
+	) {
+		try {
+			const embedResponse = await requestUrl({
+				url: `https://www.instagram.com/reel/${parsedUrl.id}/embed/`,
+				method: "GET",
+				headers,
+				throw: false,
+			});
+			if (
+				embedResponse.status === 200 &&
+				embedResponse.arrayBuffer.byteLength <= MAX_HTML_BYTES
+			) {
+				for (const videoUrl of extractInstagramEmbedVideoUrls(
+					embedResponse.text,
+				)) {
+					collector.add(videoUrl, "video");
+				}
+			}
+		} catch {
+			// Keep the public cover as a fallback when Instagram blocks embed data.
+		}
+	}
+
+	if (
+		ogImage &&
+		(!fetchVideos ||
+			!(
+				parsedUrl.platform === "instagram" &&
+				collector.items.some((item) => item.type === "video")
+			))
+	) {
+		collector.add(ogImage, "image");
+	}
 
 	const genericLandingPage =
 		/Join Threads to share ideas|Log in with your Instagram/i.test(content);

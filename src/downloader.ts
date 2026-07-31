@@ -344,15 +344,21 @@ export async function generateSocialNoteContent(
 		? new Date(post.timestamp).toISOString().split("T")[0]
 		: new Date().toISOString().split("T")[0];
 	const savedAt = new Date().toISOString();
+	const platformLabel =
+		post.platform === "threads" ? "Threads" : "Instagram";
 	const tags = [
-		...settings.tags.map(sanitizeTag),
-		sanitizeTag(`${post.platform}/${post.authorUsername}`),
-	].filter(Boolean);
+		...new Set(
+			[
+				...settings.tags.map(sanitizeTag),
+				sanitizeTag(`${post.platform}/${post.authorUsername}`),
+			].filter(Boolean),
+		),
+	];
 	const hasThread = Boolean(
 		settings.unrollThreadChain && post.replyChain?.length,
 	);
 	const values: Record<string, string> = {
-		platform: post.platform,
+		platform: platformLabel,
 		platform_yaml: yamlString(post.platform),
 		id: post.id,
 		id_yaml: yamlString(post.id),
@@ -376,7 +382,7 @@ export async function generateSocialNoteContent(
 	};
 
 	const rawTitle = replaceTemplate(settings.noteTitleTemplate, {
-		platform: post.platform,
+		platform: platformLabel,
 		author_username: post.authorUsername,
 		author_name: post.authorName,
 		id: post.id,
@@ -461,6 +467,41 @@ async function nextAvailablePath(
 	throw new Error("Could not find an available note filename.");
 }
 
+async function isManagedPostFile(
+	app: App,
+	file: TFile,
+	post: SocialPost,
+): Promise<boolean> {
+	const existing = await app.vault.read(file);
+	return (
+		existing.includes(marker(post.platform, post.id, "start")) &&
+		existing.includes(marker(post.platform, post.id, "end"))
+	);
+}
+
+async function findLegacyManagedFile(
+	app: App,
+	folderPath: string,
+	post: SocialPost,
+	excludedPaths: Set<string>,
+): Promise<TFile | null> {
+	const folder = app.vault.getAbstractFileByPath(folderPath);
+	if (!(folder instanceof TFolder)) return null;
+
+	for (const child of folder.children) {
+		if (
+			child instanceof TFile &&
+			child.extension === "md" &&
+			child.basename.includes(post.id) &&
+			!excludedPaths.has(child.path) &&
+			(await isManagedPostFile(app, child, post))
+		) {
+			return child;
+		}
+	}
+	return null;
+}
+
 export async function saveSocialPostToVault(
 	app: App,
 	post: SocialPost,
@@ -509,16 +550,6 @@ export async function saveSocialPostToVault(
 	);
 	const managed = wrapManagedContent(post, generated.content);
 	const preferred = app.vault.getAbstractFileByPath(preferredPath);
-	if (preferred instanceof TFile) {
-		const existing = await app.vault.read(preferred);
-		if (
-			existing.includes(marker(post.platform, post.id, "start")) &&
-			existing.includes(marker(post.platform, post.id, "end"))
-		) {
-			await app.vault.process(preferred, () => managed);
-			return { file: preferred };
-		}
-	}
 	const identityTitle = sanitizeFileName(
 		`${generated.title} - ${post.platform}-${post.id}`,
 	);
@@ -526,16 +557,45 @@ export async function saveSocialPostToVault(
 		`${destination.folder}/${identityTitle}.md`,
 	);
 	const identityFile = app.vault.getAbstractFileByPath(identityPath);
-	if (identityFile instanceof TFile) {
-		const existing = await app.vault.read(identityFile);
-		if (
-			existing.includes(marker(post.platform, post.id, "start")) &&
-			existing.includes(marker(post.platform, post.id, "end"))
-		) {
-			await app.vault.process(identityFile, () => managed);
-			return { file: identityFile };
+
+	if (
+		preferred instanceof TFile &&
+		(await isManagedPostFile(app, preferred, post))
+	) {
+		await app.vault.process(preferred, () => managed);
+		return { file: preferred };
+	}
+	if (
+		identityFile instanceof TFile &&
+		(await isManagedPostFile(app, identityFile, post))
+	) {
+		await app.vault.process(identityFile, () => managed);
+		return { file: identityFile };
+	}
+
+	const legacyManaged = await findLegacyManagedFile(
+		app,
+		destination.folder,
+		post,
+		new Set([preferredPath, identityPath]),
+	);
+	if (legacyManaged) {
+		await app.vault.process(legacyManaged, () => managed);
+		const targetPath = !preferred
+			? preferredPath
+			: !identityFile
+				? identityPath
+				: legacyManaged.path;
+		if (targetPath !== legacyManaged.path) {
+			await app.fileManager.renameFile(legacyManaged, targetPath);
 		}
-	} else if (!identityFile) {
+		return { file: legacyManaged };
+	}
+
+	if (!preferred) {
+		return { file: await app.vault.create(preferredPath, managed) };
+	}
+	if (!identityFile) {
 		return { file: await app.vault.create(identityPath, managed) };
 	}
 	const path = await nextAvailablePath(

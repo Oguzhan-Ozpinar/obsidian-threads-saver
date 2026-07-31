@@ -423,15 +423,20 @@ async function generateSocialNoteContent(app, post, settings) {
   const media = await renderMedia(app, post, settings);
   const date = post.timestamp ? new Date(post.timestamp).toISOString().split("T")[0] : (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
   const savedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const platformLabel = post.platform === "threads" ? "Threads" : "Instagram";
   const tags = [
-    ...settings.tags.map(sanitizeTag),
-    sanitizeTag(`${post.platform}/${post.authorUsername}`)
-  ].filter(Boolean);
+    ...new Set(
+      [
+        ...settings.tags.map(sanitizeTag),
+        sanitizeTag(`${post.platform}/${post.authorUsername}`)
+      ].filter(Boolean)
+    )
+  ];
   const hasThread = Boolean(
     settings.unrollThreadChain && post.replyChain?.length
   );
   const values = {
-    platform: post.platform,
+    platform: platformLabel,
     platform_yaml: yamlString(post.platform),
     id: post.id,
     id_yaml: yamlString(post.id),
@@ -453,7 +458,7 @@ ${media.join("\n\n")}` : "",
     reply_chain: settings.unrollThreadChain ? formatReplyChain(post) : ""
   };
   const rawTitle = replaceTemplate(settings.noteTitleTemplate, {
-    platform: post.platform,
+    platform: platformLabel,
     author_username: post.authorUsername,
     author_name: post.authorName,
     id: post.id
@@ -526,6 +531,20 @@ async function nextAvailablePath(app, folder, title) {
   }
   throw new Error("Could not find an available note filename.");
 }
+async function isManagedPostFile(app, file, post) {
+  const existing = await app.vault.read(file);
+  return existing.includes(marker(post.platform, post.id, "start")) && existing.includes(marker(post.platform, post.id, "end"));
+}
+async function findLegacyManagedFile(app, folderPath, post, excludedPaths) {
+  const folder = app.vault.getAbstractFileByPath(folderPath);
+  if (!(folder instanceof import_obsidian.TFolder)) return null;
+  for (const child of folder.children) {
+    if (child instanceof import_obsidian.TFile && child.extension === "md" && child.basename.includes(post.id) && !excludedPaths.has(child.path) && await isManagedPostFile(app, child, post)) {
+      return child;
+    }
+  }
+  return null;
+}
 async function saveSocialPostToVault(app, post, settings) {
   const destination = destinationFor(post, settings);
   const generated = await generateSocialNoteContent(app, post, settings);
@@ -572,13 +591,6 @@ ${managedBlock}
   );
   const managed = wrapManagedContent(post, generated.content);
   const preferred = app.vault.getAbstractFileByPath(preferredPath);
-  if (preferred instanceof import_obsidian.TFile) {
-    const existing = await app.vault.read(preferred);
-    if (existing.includes(marker(post.platform, post.id, "start")) && existing.includes(marker(post.platform, post.id, "end"))) {
-      await app.vault.process(preferred, () => managed);
-      return { file: preferred };
-    }
-  }
   const identityTitle = sanitizeFileName(
     `${generated.title} - ${post.platform}-${post.id}`
   );
@@ -586,13 +598,32 @@ ${managedBlock}
     `${destination.folder}/${identityTitle}.md`
   );
   const identityFile = app.vault.getAbstractFileByPath(identityPath);
-  if (identityFile instanceof import_obsidian.TFile) {
-    const existing = await app.vault.read(identityFile);
-    if (existing.includes(marker(post.platform, post.id, "start")) && existing.includes(marker(post.platform, post.id, "end"))) {
-      await app.vault.process(identityFile, () => managed);
-      return { file: identityFile };
+  if (preferred instanceof import_obsidian.TFile && await isManagedPostFile(app, preferred, post)) {
+    await app.vault.process(preferred, () => managed);
+    return { file: preferred };
+  }
+  if (identityFile instanceof import_obsidian.TFile && await isManagedPostFile(app, identityFile, post)) {
+    await app.vault.process(identityFile, () => managed);
+    return { file: identityFile };
+  }
+  const legacyManaged = await findLegacyManagedFile(
+    app,
+    destination.folder,
+    post,
+    /* @__PURE__ */ new Set([preferredPath, identityPath])
+  );
+  if (legacyManaged) {
+    await app.vault.process(legacyManaged, () => managed);
+    const targetPath = !preferred ? preferredPath : !identityFile ? identityPath : legacyManaged.path;
+    if (targetPath !== legacyManaged.path) {
+      await app.fileManager.renameFile(legacyManaged, targetPath);
     }
-  } else if (!identityFile) {
+    return { file: legacyManaged };
+  }
+  if (!preferred) {
+    return { file: await app.vault.create(preferredPath, managed) };
+  }
+  if (!identityFile) {
     return { file: await app.vault.create(identityPath, managed) };
   }
   const path = await nextAvailablePath(
@@ -601,6 +632,103 @@ ${managedBlock}
     identityTitle
   );
   return { file: await app.vault.create(path, managed) };
+}
+
+// src/types.ts
+var DEFAULT_NOTE_BODY_TEMPLATE = `---
+platform: {{platform_yaml}}
+social_post_id: {{id_yaml}}
+author: {{author_display_yaml}}
+username: {{author_username_yaml}}
+original_url: {{url_yaml}}
+date_saved: {{date_yaml}}
+tags:
+{{tags}}
+---
+
+{{visual_card}}
+
+{{content}}
+
+{{media}}
+
+{{reply_chain}}
+
+---
+*Saved with Social Saver on {{saved_at}}*
+`;
+var DEFAULT_SETTINGS = {
+  threadsSaveMode: "folder",
+  instagramSaveMode: "folder",
+  threadsFolder: "Threads",
+  instagramFolder: "Instagram",
+  threadsTargetFile: "Threads.md",
+  instagramTargetFile: "Instagram.md",
+  attachmentsFolder: "attachments/social-saver",
+  downloadMediaLocally: true,
+  downloadVideos: true,
+  includeMedia: true,
+  clipboardAutoDetect: false,
+  unrollThreadChain: true,
+  useVisualCard: false,
+  noteTitleTemplate: "{{platform}} - {{author_username}} - {{id}}",
+  noteBodyTemplate: DEFAULT_NOTE_BODY_TEMPLATE,
+  tags: ["social-archive"],
+  customUserAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+};
+
+// src/migrations.ts
+var LEGACY_NOTE_TITLE_TEMPLATE = "Threads - {{author_username}} - {{id}}";
+var LEGACY_NOTE_BODY_TEMPLATE = `---
+author: "{{author_name}} (@{{author_username}})"
+username: "{{author_username}}"
+original_url: "{{url}}"
+date_saved: {{date}}
+tags:
+{{tags}}
+---
+
+{{visual_card}}
+
+{{content}}
+
+{{media}}
+
+{{reply_chain}}
+
+---
+*Saved with [Threads Saver](https://github.com/Oguzhan-Ozpinar/obsidian-threads-saver) on {{saved_at}}*
+`;
+function migrateStoredSettings(stored) {
+  const settings = { ...DEFAULT_SETTINGS };
+  let migrated = false;
+  for (const key of Object.keys(DEFAULT_SETTINGS)) {
+    const value = stored[key];
+    if (value !== void 0) {
+      settings[key] = value;
+    }
+  }
+  if (stored.notesFolder && !stored.threadsFolder) {
+    settings.threadsFolder = stored.notesFolder;
+    migrated = true;
+  }
+  if (settings.noteTitleTemplate === LEGACY_NOTE_TITLE_TEMPLATE) {
+    settings.noteTitleTemplate = DEFAULT_SETTINGS.noteTitleTemplate;
+    migrated = true;
+  }
+  if (settings.noteBodyTemplate === LEGACY_NOTE_BODY_TEMPLATE) {
+    settings.noteBodyTemplate = DEFAULT_NOTE_BODY_TEMPLATE;
+    migrated = true;
+  }
+  if (Array.isArray(settings.tags) && settings.tags.length === 1 && settings.tags[0].trim().toLowerCase() === "threads") {
+    settings.tags = [...DEFAULT_SETTINGS.tags];
+    migrated = true;
+  }
+  if (settings.attachmentsFolder === "attachments/threads") {
+    settings.attachmentsFolder = DEFAULT_SETTINGS.attachmentsFolder;
+    migrated = true;
+  }
+  return { settings, migrated };
 }
 
 // src/parser.ts
@@ -689,20 +817,26 @@ function collectMediaFromObject(object, add) {
       const item = asObject(rawItem);
       if (!item) continue;
       const video2 = bestCandidateUrl(item.video_versions);
-      if (video2) add(video2, "video");
-      const image2 = bestCandidateUrl(
-        getPath(item, "image_versions2", "candidates")
-      );
-      if (image2) add(image2, "image");
+      if (video2) {
+        add(video2, "video");
+      } else {
+        const image = bestCandidateUrl(
+          getPath(item, "image_versions2", "candidates")
+        );
+        if (image) add(image, "image");
+      }
     }
     return;
   }
   const video = bestCandidateUrl(object.video_versions);
-  if (video) add(video, "video");
-  const image = bestCandidateUrl(
-    getPath(object, "image_versions2", "candidates")
-  );
-  if (image) add(image, "image");
+  if (video) {
+    add(video, "video");
+  } else {
+    const image = bestCandidateUrl(
+      getPath(object, "image_versions2", "candidates")
+    );
+    if (image) add(image, "image");
+  }
 }
 function walkJson(root, visitor) {
   const stack = [
@@ -741,16 +875,30 @@ function walkJson(root, visitor) {
   }
 }
 function scorePostObject(object, id) {
-  let score = 0;
   const objectId = asString(object.code) || asString(object.shortcode) || asString(object.pk) || asString(object.id);
-  if (objectId === id || objectId.startsWith(`${id}_`)) score += 100;
+  const matchesId = objectId === id || objectId.startsWith(`${id}_`);
+  if (!matchesId) return 0;
+  let score = 100;
+  let contentSignals = 0;
   if (asString(getPath(object, "caption", "text"))) score += 20;
-  if (asString(getPath(object, "user", "username"))) score += 10;
-  if (asArray(object.carousel_media).length > 0) score += 10;
-  if (asArray(getPath(object, "image_versions2", "candidates")).length > 0)
+  if (asString(getPath(object, "caption", "text"))) contentSignals += 1;
+  if (asString(getPath(object, "user", "username")) || asString(getPath(object, "owner", "username")) || asString(object.username)) {
+    score += 10;
+    contentSignals += 1;
+  }
+  if (asArray(object.carousel_media).length > 0) {
+    score += 10;
+    contentSignals += 1;
+  }
+  if (asArray(getPath(object, "image_versions2", "candidates")).length > 0) {
     score += 5;
-  if (asArray(object.video_versions).length > 0) score += 5;
-  return score;
+    contentSignals += 1;
+  }
+  if (asArray(object.video_versions).length > 0) {
+    score += 5;
+    contentSignals += 1;
+  }
+  return contentSignals > 0 ? score : 1;
 }
 function extractTimestamp(object) {
   const seconds = asNumber(object.taken_at) ?? asNumber(object.device_timestamp) ?? asNumber(object.created_at);
@@ -776,10 +924,64 @@ function cleanDescription(value, platform) {
   }
   return content;
 }
+function extractInstagramUsernameFromMetaUrl(value, expectedId) {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    if (url.protocol !== "https:" || !["instagram.com", "www.instagram.com"].includes(hostname)) {
+      return "";
+    }
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (segments.length >= 3 && ["p", "reel", "reels", "tv"].includes(segments[1]) && segments[2] === expectedId && /^[A-Za-z0-9._]+$/.test(segments[0])) {
+      return segments[0];
+    }
+  } catch {
+  }
+  return "";
+}
+function extractInstagramEmbedVideoUrls(html) {
+  const urls = [];
+  const seen = /* @__PURE__ */ new Set();
+  const addDecodedUrl = (decoded) => {
+    if (typeof decoded !== "string") return;
+    const valid = validateMediaUrl(decoded);
+    if (!valid) return;
+    const normalized = valid.toString();
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    urls.push(normalized);
+  };
+  const directPattern = /"video_url":("(?:\\.|[^"\\])*")/g;
+  let directMatch;
+  while (urls.length < MAX_MEDIA_ITEMS2 && (directMatch = directPattern.exec(html)) !== null) {
+    try {
+      addDecodedUrl(JSON.parse(directMatch[1]));
+    } catch {
+    }
+  }
+  const escapedPattern = /\\"video_url\\":\\"((?:\\\\.|[^"\\])*)\\"/g;
+  let escapedMatch;
+  while (urls.length < MAX_MEDIA_ITEMS2 && (escapedMatch = escapedPattern.exec(html)) !== null) {
+    let decoded = escapedMatch[1];
+    for (let pass = 0; pass < 2; pass += 1) {
+      try {
+        decoded = JSON.parse(
+          `"${decoded.replace(/"/g, '\\"')}"`
+        );
+      } catch {
+        decoded = "";
+        break;
+      }
+    }
+    addDecodedUrl(decoded);
+  }
+  return urls;
+}
 function authorFromMeta(title, description, fallbackUsername) {
   const usernameMatch = title.match(/\(@([A-Za-z0-9._]+)\)/) ?? description.match(/@([A-Za-z0-9._]+)/);
   const username = usernameMatch?.[1] ?? fallbackUsername;
-  const nameCandidate = title.split(/[•|]/)[0].replace(/\(@[^)]+\)/, "").replace(/^@/, "").trim();
+  const instagramName = title.match(/^(.+?)\s+on Instagram(?::|$)/i)?.[1];
+  const nameCandidate = instagramName?.trim() || title.split(/[•|]/)[0].replace(/\(@[^)]+\)/, "").replace(/^@/, "").trim();
   return {
     name: nameCandidate || username || "Unknown author",
     username: username || "unknown"
@@ -818,7 +1020,7 @@ function parseReplyChain(jsonRoots, mainAuthor) {
   }
   return replies.slice(0, 20);
 }
-async function parseSocialPost(inputUrl, sessionCookie, userProvidedUserAgent) {
+async function parseSocialPost(inputUrl, sessionCookie, userProvidedUserAgent, options = {}) {
   const parsedUrl = parseSupportedSocialUrl(inputUrl);
   if (!parsedUrl) {
     throw new Error("Unsupported or unsafe Threads/Instagram URL.");
@@ -828,6 +1030,7 @@ async function parseSocialPost(inputUrl, sessionCookie, userProvidedUserAgent) {
     Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9"
   };
+  const fetchVideos = options.fetchVideos ?? true;
   const cookie = normalizeSessionCookie(sessionCookie);
   const requestPage = async (cookieHeader) => {
     const requestHeaders = { ...headers };
@@ -852,17 +1055,17 @@ async function parseSocialPost(inputUrl, sessionCookie, userProvidedUserAgent) {
   let doc = new DOMParser().parseFromString(response.text, "text/html");
   let cookieWasSent = false;
   const initialDescription = getMeta(doc, "og:description") || getMeta(doc, "twitter:description");
-  const initialImage = getMeta(doc, "og:image") || getMeta(doc, "twitter:image");
   const initialLooksLoggedOut = /Join Threads to share ideas|Log in with your Instagram/i.test(
     initialDescription
-  ) || !initialDescription && !initialImage;
+  ) || !initialDescription;
   if (cookie && initialLooksLoggedOut && !["share", "t"].includes(parsedUrl.kind)) {
     response = await requestPage(cookie);
     doc = new DOMParser().parseFromString(response.text, "text/html");
     cookieWasSent = true;
   }
-  const title = getMeta(doc, "og:title") || getMeta(doc, "twitter:title");
+  const title = parsedUrl.platform === "instagram" ? getMeta(doc, "twitter:title") || getMeta(doc, "og:title") : getMeta(doc, "og:title") || getMeta(doc, "twitter:title");
   const description = getMeta(doc, "og:description") || getMeta(doc, "twitter:description");
+  const canonicalMetaUrl = getMeta(doc, "og:url");
   const ogImage = getMeta(doc, "og:image") || getMeta(doc, "twitter:image");
   const ogVideo = getMeta(doc, "og:video:secure_url") || getMeta(doc, "og:video") || getMeta(doc, "twitter:player:stream");
   const jsonRoots = [];
@@ -881,30 +1084,60 @@ async function parseSocialPost(inputUrl, sessionCookie, userProvidedUserAgent) {
     } catch {
     }
   }
-  let bestPost = null;
-  let bestScore = 0;
+  const bestMatch = {
+    post: null,
+    score: 0
+  };
   for (const root of jsonRoots) {
     walkJson(root, (object) => {
       const score = scorePostObject(object, parsedUrl.id);
-      if (score > bestScore) {
-        bestScore = score;
-        bestPost = object;
+      if (score > bestMatch.score) {
+        bestMatch.score = score;
+        bestMatch.post = object;
       }
     });
   }
+  const metaUsername = parsedUrl.platform === "instagram" ? extractInstagramUsernameFromMetaUrl(
+    canonicalMetaUrl,
+    parsedUrl.id
+  ) : "";
   const fallbackAuthor = authorFromMeta(
     title,
     description,
-    parsedUrl.username ?? ""
+    metaUsername || parsedUrl.username || ""
   );
-  const postObject = bestPost;
-  const authorUsername = (postObject ? asString(getPath(postObject, "user", "username")) : "") || fallbackAuthor.username;
-  const authorName = (postObject ? asString(getPath(postObject, "user", "full_name")) : "") || fallbackAuthor.name;
+  const postObject = bestMatch.score >= 100 && bestMatch.post ? bestMatch.post : null;
+  const authorUsername = (postObject ? asString(getPath(postObject, "user", "username")) || asString(getPath(postObject, "owner", "username")) || asString(postObject.username) : "") || metaUsername || fallbackAuthor.username;
+  const authorName = (postObject ? asString(getPath(postObject, "user", "full_name")) || asString(getPath(postObject, "owner", "full_name")) : "") || fallbackAuthor.name;
   const content = (postObject ? asString(getPath(postObject, "caption", "text")) : "") || cleanDescription(description, parsedUrl.platform) || "No text content found in post.";
   const collector = createMediaCollector();
-  if (postObject) collectMediaFromObject(postObject, collector.add);
-  if (ogVideo) collector.add(ogVideo, "video");
-  if (ogImage) collector.add(ogImage, "image");
+  const addRequestedMedia = (url, type) => {
+    if (type === "video" && !fetchVideos) return;
+    collector.add(url, type);
+  };
+  if (postObject) collectMediaFromObject(postObject, addRequestedMedia);
+  if (ogVideo && fetchVideos) collector.add(ogVideo, "video");
+  if (fetchVideos && parsedUrl.platform === "instagram" && parsedUrl.kind === "reel" && !collector.items.some((item) => item.type === "video")) {
+    try {
+      const embedResponse = await (0, import_obsidian2.requestUrl)({
+        url: `https://www.instagram.com/reel/${parsedUrl.id}/embed/`,
+        method: "GET",
+        headers,
+        throw: false
+      });
+      if (embedResponse.status === 200 && embedResponse.arrayBuffer.byteLength <= MAX_HTML_BYTES) {
+        for (const videoUrl of extractInstagramEmbedVideoUrls(
+          embedResponse.text
+        )) {
+          collector.add(videoUrl, "video");
+        }
+      }
+    } catch {
+    }
+  }
+  if (ogImage && (!fetchVideos || !(parsedUrl.platform === "instagram" && collector.items.some((item) => item.type === "video")))) {
+    collector.add(ogImage, "image");
+  }
   const genericLandingPage = /Join Threads to share ideas|Log in with your Instagram/i.test(content);
   const missingPostData = !postObject && !description && !ogImage && !ogVideo;
   if (genericLandingPage || missingPostData) {
@@ -927,51 +1160,6 @@ async function parseSocialPost(inputUrl, sessionCookie, userProvidedUserAgent) {
 
 // src/settings.ts
 var import_obsidian3 = require("obsidian");
-
-// src/types.ts
-var DEFAULT_NOTE_BODY_TEMPLATE = `---
-platform: {{platform_yaml}}
-social_post_id: {{id_yaml}}
-author: {{author_display_yaml}}
-username: {{author_username_yaml}}
-original_url: {{url_yaml}}
-date_saved: {{date_yaml}}
-tags:
-{{tags}}
----
-
-{{visual_card}}
-
-{{content}}
-
-{{media}}
-
-{{reply_chain}}
-
----
-*Saved with Social Saver on {{saved_at}}*
-`;
-var DEFAULT_SETTINGS = {
-  threadsSaveMode: "folder",
-  instagramSaveMode: "folder",
-  threadsFolder: "Threads",
-  instagramFolder: "Instagram",
-  threadsTargetFile: "Threads.md",
-  instagramTargetFile: "Instagram.md",
-  attachmentsFolder: "attachments/social-saver",
-  downloadMediaLocally: true,
-  downloadVideos: true,
-  includeMedia: true,
-  clipboardAutoDetect: false,
-  unrollThreadChain: true,
-  useVisualCard: false,
-  noteTitleTemplate: "{{platform}} - {{author_username}} - {{id}}",
-  noteBodyTemplate: DEFAULT_NOTE_BODY_TEMPLATE,
-  tags: ["social-archive"],
-  customUserAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-};
-
-// src/settings.ts
 var ThreadsSaverSettingTab = class extends import_obsidian3.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -1229,21 +1417,13 @@ var SocialSaverPlugin = class extends import_obsidian4.Plugin {
   }
   async loadSettings() {
     const stored = await this.loadData() ?? {};
-    const merged = { ...DEFAULT_SETTINGS };
-    for (const key of Object.keys(DEFAULT_SETTINGS)) {
-      const value = stored[key];
-      if (value !== void 0) {
-        merged[key] = value;
-      }
-    }
-    if (stored.notesFolder && !stored.threadsFolder) {
-      merged.threadsFolder = stored.notesFolder;
-    }
-    this.settings = merged;
+    const migration = migrateStoredSettings(stored);
+    this.settings = migration.settings;
     if (stored.sessionCookie && !this.getSessionCookie()) {
       this.setSessionCookie(stored.sessionCookie);
+      migration.migrated = true;
     }
-    if (stored.sessionCookie || stored.notesFolder) {
+    if (stored.sessionCookie || migration.migrated) {
       await this.saveSettings();
     }
   }
@@ -1360,7 +1540,8 @@ var SocialSaverPlugin = class extends import_obsidian4.Plugin {
       const post = await parseSocialPost(
         url,
         this.getSessionCookie(),
-        this.settings.customUserAgent
+        this.settings.customUserAgent,
+        { fetchVideos: false }
       );
       editor.replaceSelection(
         inlinePostMarkdown(
@@ -1380,7 +1561,8 @@ var SocialSaverPlugin = class extends import_obsidian4.Plugin {
       const post = await parseSocialPost(
         canonicalUrl,
         this.getSessionCookie(),
-        this.settings.customUserAgent
+        this.settings.customUserAgent,
+        { fetchVideos: false }
       );
       const markdown = inlinePostMarkdown(
         post.platform,
@@ -1421,7 +1603,10 @@ var SocialSaverPlugin = class extends import_obsidian4.Plugin {
       const post = await parseSocialPost(
         parsed.canonicalUrl,
         this.getSessionCookie(),
-        this.settings.customUserAgent
+        this.settings.customUserAgent,
+        {
+          fetchVideos: this.settings.includeMedia && this.settings.downloadVideos
+        }
       );
       const result = await saveSocialPostToVault(
         this.app,

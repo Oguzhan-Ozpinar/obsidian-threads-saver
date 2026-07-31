@@ -1,5 +1,9 @@
 import { Editor, Notice, Plugin } from "obsidian";
 import { saveSocialPostToVault } from "./downloader";
+import {
+	migrateStoredSettings,
+	type LegacyStoredSettings,
+} from "./migrations";
 import { parseSocialPost } from "./parser";
 import {
 	escapeMarkdownText,
@@ -18,11 +22,6 @@ import {
 interface ProcessAndSaveOptions {
 	openFile?: boolean;
 	showNotices?: boolean;
-}
-
-interface LegacyStoredSettings extends Partial<PluginSettings> {
-	sessionCookie?: string;
-	notesFolder?: string;
 }
 
 const SESSION_SECRET_ID = "social-saver-sessionid";
@@ -149,24 +148,14 @@ export default class SocialSaverPlugin extends Plugin {
 
 	async loadSettings(): Promise<void> {
 		const stored = ((await this.loadData()) ?? {}) as LegacyStoredSettings;
-		const merged = { ...DEFAULT_SETTINGS } as PluginSettings;
-		for (const key of Object.keys(DEFAULT_SETTINGS) as Array<
-			keyof PluginSettings
-		>) {
-			const value = stored[key];
-			if (value !== undefined) {
-				(merged as unknown as Record<string, unknown>)[key] = value;
-			}
-		}
-		if (stored.notesFolder && !stored.threadsFolder) {
-			merged.threadsFolder = stored.notesFolder;
-		}
-		this.settings = merged;
+		const migration = migrateStoredSettings(stored);
+		this.settings = migration.settings;
 
 		if (stored.sessionCookie && !this.getSessionCookie()) {
 			this.setSessionCookie(stored.sessionCookie);
+			migration.migrated = true;
 		}
-		if (stored.sessionCookie || stored.notesFolder) {
+		if (stored.sessionCookie || migration.migrated) {
 			await this.saveSettings();
 		}
 	}
@@ -297,6 +286,7 @@ export default class SocialSaverPlugin extends Plugin {
 				url,
 				this.getSessionCookie(),
 				this.settings.customUserAgent,
+				{ fetchVideos: false },
 			);
 			editor.replaceSelection(
 				inlinePostMarkdown(
@@ -324,6 +314,7 @@ export default class SocialSaverPlugin extends Plugin {
 				canonicalUrl,
 				this.getSessionCookie(),
 				this.settings.customUserAgent,
+				{ fetchVideos: false },
 			);
 			const markdown = inlinePostMarkdown(
 				post.platform,
@@ -370,6 +361,11 @@ export default class SocialSaverPlugin extends Plugin {
 				parsed.canonicalUrl,
 				this.getSessionCookie(),
 				this.settings.customUserAgent,
+				{
+					fetchVideos:
+						this.settings.includeMedia &&
+						this.settings.downloadVideos,
+				},
 			);
 			const result = await saveSocialPostToVault(
 				this.app,

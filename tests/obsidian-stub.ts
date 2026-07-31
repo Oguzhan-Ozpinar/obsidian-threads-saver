@@ -4,10 +4,21 @@ export class TFile {
 	constructor(path: string) {
 		this.path = path;
 	}
+
+	get basename(): string {
+		const name = this.path.split("/").pop() ?? "";
+		return name.replace(/\.[^.]+$/, "");
+	}
+
+	get extension(): string {
+		const name = this.path.split("/").pop() ?? "";
+		return name.includes(".") ? (name.split(".").pop() ?? "") : "";
+	}
 }
 
 export class TFolder {
 	path: string;
+	children: Array<TFile | TFolder> = [];
 
 	constructor(path: string) {
 		this.path = path;

@@ -32,9 +32,11 @@ assert.ok(generated.content.includes("&lt;script&gt;"));
 assert.ok(generated.content.includes("\\n---\\nadmin: true"));
 assert.ok(!generated.title.includes("<"));
 
-const preferredPath = "Threads/threads - alice - abc123.md";
+const preferredPath = "Threads/Threads - alice - abc123.md";
 const userFile = new TFile(preferredPath);
-const folders = new Map<string, TFolder>([["Threads", new TFolder("Threads")]]);
+const threadsFolder = new TFolder("Threads");
+threadsFolder.children.push(userFile);
+const folders = new Map<string, TFolder>([["Threads", threadsFolder]]);
 const files = new Map<string, TFile>([[preferredPath, userFile]]);
 const contents = new Map<string, string>([[preferredPath, "# My private note\n"]]);
 const createdPaths: string[] = [];
@@ -61,10 +63,25 @@ const mockApp = {
 			files.set(path, file);
 			contents.set(path, content);
 			createdPaths.push(path);
+			const parentPath = path.includes("/")
+				? path.slice(0, path.lastIndexOf("/"))
+				: "";
+			folders.get(parentPath)?.children.push(file);
 			return file;
 		},
 		async createBinary() {
 			throw new Error("Media should be disabled in this test.");
+		},
+	},
+	fileManager: {
+		async renameFile(file: TFile, targetPath: string) {
+			const previousPath = file.path;
+			files.delete(previousPath);
+			const content = contents.get(previousPath) ?? "";
+			contents.delete(previousPath);
+			file.path = targetPath;
+			files.set(targetPath, file);
+			contents.set(targetPath, content);
 		},
 	},
 } as unknown as App;
@@ -77,10 +94,10 @@ const saved = await saveSocialPostToVault(
 assert.equal(contents.get(preferredPath), "# My private note\n");
 assert.equal(
 	saved.file.path,
-	"Threads/threads - alice - abc123 - threads-abc123.md",
+	"Threads/Threads - alice - abc123 - threads-abc123.md",
 );
 assert.deepEqual(createdPaths, [
-	"Threads/threads - alice - abc123 - threads-abc123.md",
+	"Threads/Threads - alice - abc123 - threads-abc123.md",
 ]);
 
 const firstManagedContent = contents.get(saved.file.path);
@@ -93,6 +110,15 @@ const updated = await saveSocialPostToVault(
 );
 assert.equal(updated.file.path, saved.file.path);
 assert.ok(contents.get(saved.file.path)?.includes("Updated, still safe"));
+assert.equal(createdPaths.length, 1);
+
+safeSettings.noteTitleTemplate = "{{platform}} archive - {{id}}";
+const renamed = await saveSocialPostToVault(
+	mockApp,
+	maliciousPost,
+	safeSettings,
+);
+assert.equal(renamed.file.path, "Threads/Threads archive - abc123.md");
 assert.equal(createdPaths.length, 1);
 
 const instagramPost: SocialPost = {
@@ -110,6 +136,18 @@ const archiveSettings = {
 	instagramSaveMode: "single-file" as const,
 	instagramTargetFile: "Social/Instagram.md",
 };
+const defaultInstagramNote = await generateSocialNoteContent(
+	mockApp,
+	instagramPost,
+	{
+		...DEFAULT_SETTINGS,
+		includeMedia: false,
+	},
+);
+assert.equal(
+	defaultInstagramNote.title,
+	"Instagram - bob - reel123",
+);
 const archived = await saveSocialPostToVault(
 	mockApp,
 	instagramPost,

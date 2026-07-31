@@ -1,6 +1,6 @@
 {
   "name": "obsidian-threads-saver",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Archive Threads and Instagram posts, carousels, and Reels as safe Markdown notes in Obsidian.",
   "main": "main.js",
   "scripts": {
