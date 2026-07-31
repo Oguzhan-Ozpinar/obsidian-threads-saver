@@ -1,9 +1,9 @@
 {
   "id": "obsidian-threads-saver",
-  "name": "Threads Saver",
-  "version": "1.0.3",
-  "minAppVersion": "1.4.0",
-  "description": "Save Instagram Threads posts into formatted Markdown notes inside Obsidian, optimized for mobile & desktop.",
+  "name": "Threads & Instagram Saver",
+  "version": "1.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "Archive Threads and Instagram posts, carousels, and Reels as safe Markdown notes.",
   "author": "Oguzhan-Ozpinar",
   "authorUrl": "https://github.com/Oguzhan-Ozpinar",
   "isDesktopOnly": false

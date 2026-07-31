@@ -1,359 +1,427 @@
-import { Editor, Notice, Plugin, TFile } from "obsidian";
-import { DEFAULT_SETTINGS, PluginSettings } from "./types";
+import { Editor, Notice, Plugin } from "obsidian";
+import { saveSocialPostToVault } from "./downloader";
+import { parseSocialPost } from "./parser";
+import {
+	escapeMarkdownText,
+	escapeMarkdownUrl,
+	extractAllSocialUrls,
+	extractSocialUrlMatches,
+	parseSupportedSocialUrl,
+} from "./security";
 import { ThreadsSaverSettingTab } from "./settings";
-import { parseThreadsPost } from "./parser";
-import { generateThreadsNoteContent, saveThreadsPostToVault } from "./downloader";
+import {
+	DEFAULT_SETTINGS,
+	type PluginSettings,
+	type SavedPostResult,
+} from "./types";
 
 interface ProcessAndSaveOptions {
-  openFile?: boolean;
-  showNotices?: boolean;
+	openFile?: boolean;
+	showNotices?: boolean;
 }
 
-/**
- * Extracts all Threads URLs from a text string.
- */
-function extractAllThreadsUrls(text: string): string[] {
-  const matches = text.match(
-    /https?:\/\/(www\.)?threads\.(net|com)\/(@[a-zA-Z0-9_.-]+\/post\/[a-zA-Z0-9_.-]+|t\/[a-zA-Z0-9_.-]+|share\/[a-zA-Z0-9_.-]+)(?:[/?#][^\s<>"'`)\]}]*)?/gi
-  );
-  return matches
-    ? Array.from(
-        new Set(matches.map((match) => match.replace(/[.,;:!?]+$/g, "")))
-      )
-    : [];
+interface LegacyStoredSettings extends Partial<PluginSettings> {
+	sessionCookie?: string;
+	notesFolder?: string;
 }
+
+const SESSION_SECRET_ID = "social-saver-sessionid";
 
 function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export default class ThreadsSaverPlugin extends Plugin {
-  settings: PluginSettings = DEFAULT_SETTINGS;
-  private focusListener: (() => void) | null = null;
-  private lastProcessedClipboardUrl = "";
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
 
-  async onload() {
-    console.log("Loading Threads Saver Plugin");
-    await this.loadSettings();
+function inlinePostMarkdown(
+	platform: "threads" | "instagram",
+	authorUsername: string,
+	content: string,
+	url: string,
+): string {
+	const label = platform === "threads" ? "Threads" : "Instagram";
+	const quoted = content
+		.split(/\r?\n/)
+		.map((line) => `> ${escapeMarkdownText(line)}`)
+		.join("\n");
+	return `> **@${escapeMarkdownText(authorUsername)}** · ${label}\n${quoted}\n> [Original post](${escapeMarkdownUrl(url)})\n`;
+}
 
-    // 1. Ribbon Icon
-    this.addRibbonIcon("at-sign", "Save Threads Post from Clipboard", () => {
-      this.handleSaveFromClipboard();
-    });
+export default class SocialSaverPlugin extends Plugin {
+	settings: PluginSettings = { ...DEFAULT_SETTINGS };
+	private focusListener: (() => void) | null = null;
+	private lastProcessedClipboardUrl = "";
 
-    // 2. Command Palette: Save from Clipboard
-    this.addCommand({
-      id: "threads-save-from-clipboard",
-      name: "Save Threads Post from Clipboard",
-      callback: () => this.handleSaveFromClipboard(),
-    });
+	async onload(): Promise<void> {
+		await this.loadSettings();
 
-    // 3. Command Palette: Insert at Cursor
-    this.addCommand({
-      id: "threads-insert-at-cursor",
-      name: "Insert Threads Post at Cursor",
-      editorCallback: (editor: Editor) => this.handleInsertAtCursor(editor),
-    });
+		this.addRibbonIcon("archive", "Save social post from clipboard", () => {
+			void this.handleSaveFromClipboard();
+		});
 
-    // 4. Command Palette: Process All Threads Links in Active Note
-    this.addCommand({
-      id: "threads-convert-links-in-active-note",
-      name: "Process All Threads Links in Active Note",
-      callback: () => this.handleConvertActiveNoteLinks(),
-    });
+		this.addCommand({
+			id: "social-save-from-clipboard",
+			name: "Save Threads or Instagram post from clipboard",
+			callback: () => this.handleSaveFromClipboard(),
+		});
+		this.addCommand({
+			id: "social-insert-at-cursor",
+			name: "Insert Threads or Instagram post at cursor",
+			editorCallback: (editor: Editor) => this.handleInsertAtCursor(editor),
+		});
+		this.addCommand({
+			id: "social-convert-links-in-active-note",
+			name: "Process all Threads and Instagram links in active note",
+			callback: () => this.handleConvertActiveNoteLinks(),
+		});
 
-    // 5. Context Menu item for Editor
-    this.registerEvent(
-      this.app.workspace.on("editor-menu", (menu, editor) => {
-        const selectedText = editor.getSelection().trim();
-        const cursorLine = editor.getLine(editor.getCursor().line).trim();
-        const targetText = selectedText || cursorLine;
-        const urls = extractAllThreadsUrls(targetText);
+		// Keep the original command IDs so existing hotkeys continue to work.
+		this.addCommand({
+			id: "threads-save-from-clipboard",
+			name: "Save social post from clipboard (legacy command)",
+			callback: () => this.handleSaveFromClipboard(),
+		});
+		this.addCommand({
+			id: "threads-insert-at-cursor",
+			name: "Insert social post at cursor (legacy command)",
+			editorCallback: (editor: Editor) => this.handleInsertAtCursor(editor),
+		});
+		this.addCommand({
+			id: "threads-convert-links-in-active-note",
+			name: "Process social links in active note (legacy command)",
+			callback: () => this.handleConvertActiveNoteLinks(),
+		});
 
-        if (urls.length > 0) {
-          menu.addItem((item) => {
-            item
-              .setTitle("Convert Threads Link")
-              .setIcon("at-sign")
-              .onClick(async () => {
-                await this.processAndReplaceLinkInEditor(editor, urls[0]);
-              });
-          });
-        }
-      })
-    );
+		this.registerEvent(
+			this.app.workspace.on("editor-menu", (menu, editor) => {
+				const selection = editor.getSelection();
+				const lineNumber = editor.getCursor().line;
+				const source = selection || editor.getLine(lineNumber);
+				const match = extractSocialUrlMatches(source)[0];
+				if (!match) return;
 
-    // 6. Obsidian Protocol Handler for Deep Links / iOS Shortcuts
-    // URL format: obsidian://threads-saver?url=https://www.threads.com/...
-    this.registerObsidianProtocolHandler("threads-saver", async (params) => {
-      if (params.url) {
-        new Notice("Processing Threads URL from deep link...");
-        await this.processAndSaveUrl(params.url);
-      }
-    });
+				menu.addItem((item) => {
+					item
+						.setTitle("Convert social post link")
+						.setIcon("archive")
+						.onClick(() =>
+							this.processAndReplaceLinkInEditor(
+								editor,
+								match.raw,
+								match.canonicalUrl,
+								Boolean(selection),
+								lineNumber,
+							),
+						);
+				});
+			}),
+		);
 
-    // 7. Window Focus Listener for Clipboard Auto-Detect
-    this.focusListener = async () => {
-      if (!this.settings.clipboardAutoDetect) return;
-      try {
-        if (navigator.clipboard && navigator.clipboard.readText) {
-          const text = await navigator.clipboard.readText();
-          const urls = extractAllThreadsUrls(text);
-          const url = urls[0];
-          if (url && url !== this.lastProcessedClipboardUrl) {
-            this.showClipboardNotice(url);
-          }
-        }
-      } catch {
-        // Clipboard permission not granted or not focused
-      }
-    };
+		const protocolHandler = async (params: Record<string, string>) => {
+			const parsed = params.url
+				? parseSupportedSocialUrl(params.url)
+				: null;
+			if (!parsed) {
+				new Notice("Deep link contains an unsupported or unsafe URL.");
+				return;
+			}
+			await this.processAndSaveUrl(parsed.canonicalUrl);
+		};
+		this.registerObsidianProtocolHandler("social-saver", protocolHandler);
+		this.registerObsidianProtocolHandler("threads-saver", protocolHandler);
 
-    window.addEventListener("focus", this.focusListener);
+		this.focusListener = () => {
+			if (!this.settings.clipboardAutoDetect) return;
+			void this.checkClipboardOnFocus();
+		};
+		window.addEventListener("focus", this.focusListener);
+		this.addSettingTab(new ThreadsSaverSettingTab(this.app, this));
+	}
 
-    // 8. Add Settings Tab
-    this.addSettingTab(new ThreadsSaverSettingTab(this.app, this));
-  }
+	onunload(): void {
+		if (this.focusListener) {
+			window.removeEventListener("focus", this.focusListener);
+			this.focusListener = null;
+		}
+	}
 
-  onunload() {
-    console.log("Unloading Threads Saver Plugin");
-    if (this.focusListener) {
-      window.removeEventListener("focus", this.focusListener);
-      this.focusListener = null;
-    }
-  }
+	async loadSettings(): Promise<void> {
+		const stored = ((await this.loadData()) ?? {}) as LegacyStoredSettings;
+		const merged = { ...DEFAULT_SETTINGS } as PluginSettings;
+		for (const key of Object.keys(DEFAULT_SETTINGS) as Array<
+			keyof PluginSettings
+		>) {
+			const value = stored[key];
+			if (value !== undefined) {
+				(merged as unknown as Record<string, unknown>)[key] = value;
+			}
+		}
+		if (stored.notesFolder && !stored.threadsFolder) {
+			merged.threadsFolder = stored.notesFolder;
+		}
+		this.settings = merged;
 
-  async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-  }
+		if (stored.sessionCookie && !this.getSessionCookie()) {
+			this.setSessionCookie(stored.sessionCookie);
+		}
+		if (stored.sessionCookie || stored.notesFolder) {
+			await this.saveSettings();
+		}
+	}
 
-  async saveSettings() {
-    await this.saveData(this.settings);
-  }
+	async saveSettings(): Promise<void> {
+		await this.saveData(this.settings);
+	}
 
-  /**
-   * Reads clipboard and saves Threads post.
-   */
-  async handleSaveFromClipboard() {
-    try {
-      const text = await navigator.clipboard.readText();
-      const trimmed = text.trim();
-      const urls = extractAllThreadsUrls(trimmed);
-      if (urls.length === 0) {
-        new Notice("Clipboard does not contain a valid Threads URL.");
-        return;
-      }
-      await this.processAndSaveUrl(urls[0]);
-    } catch {
-      new Notice("Could not read clipboard. Please check app permissions.");
-    }
-  }
+	getSessionCookie(): string {
+		return this.app.secretStorage.getSecret(SESSION_SECRET_ID) ?? "";
+	}
 
-  /**
-   * Converts all raw Threads URLs in active note.
-   */
-  async handleConvertActiveNoteLinks() {
-    const activeFile = this.app.workspace.getActiveFile();
-    if (!activeFile) {
-      new Notice("No active note open.");
-      return;
-    }
+	setSessionCookie(value: string): void {
+		this.app.secretStorage.setSecret(SESSION_SECRET_ID, value.trim());
+	}
 
-    const content = await this.app.vault.read(activeFile);
-    const urls = extractAllThreadsUrls(content);
-    if (urls.length === 0) {
-      new Notice("No raw Threads URLs found in active note.");
-      return;
-    }
+	private async checkClipboardOnFocus(): Promise<void> {
+		try {
+			const text = await navigator.clipboard.readText();
+			const url = extractAllSocialUrls(text)[0];
+			if (url && url !== this.lastProcessedClipboardUrl) {
+				this.showClipboardNotice(url);
+			}
+		} catch {
+			// Clipboard access may be unavailable until the user grants permission.
+		}
+	}
 
-    const progressNotice = new Notice(
-      `Processing Threads links: 0/${urls.length}`,
-      0
-    );
-    const processedFiles = new Map<string, TFile>();
-    const failedUrls: string[] = [];
+	async handleSaveFromClipboard(): Promise<void> {
+		try {
+			const text = await navigator.clipboard.readText();
+			const url = extractAllSocialUrls(text)[0];
+			if (!url) {
+				new Notice(
+					"Clipboard does not contain a supported Threads or Instagram URL.",
+				);
+				return;
+			}
+			await this.processAndSaveUrl(url);
+		} catch {
+			new Notice("Could not read the clipboard. Check Obsidian permissions.");
+		}
+	}
 
-    try {
-      for (let index = 0; index < urls.length; index++) {
-        const url = urls[index];
-        progressNotice.setMessage(
-          `Processing Threads links: ${index + 1}/${urls.length}`
-        );
+	async handleConvertActiveNoteLinks(): Promise<void> {
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile) {
+			new Notice("No active note is open.");
+			return;
+		}
 
-        const savedFile = await this.processAndSaveUrl(url, {
-          openFile: false,
-          showNotices: false,
-        });
+		const initialContent = await this.app.vault.read(activeFile);
+		const matches = extractSocialUrlMatches(initialContent);
+		const urls = [...new Set(matches.map((match) => match.canonicalUrl))];
+		if (urls.length === 0) {
+			new Notice("No supported Threads or Instagram URLs found.");
+			return;
+		}
 
-        if (savedFile) {
-          processedFiles.set(url, savedFile);
-        } else {
-          failedUrls.push(url);
-        }
-      }
+		const progress = new Notice(`Processing social links: 0/${urls.length}`, 0);
+		const saved = new Map<string, SavedPostResult>();
+		const failed: string[] = [];
+		try {
+			for (let index = 0; index < urls.length; index += 1) {
+				progress.setMessage(
+					`Processing social links: ${index + 1}/${urls.length}`,
+				);
+				const result = await this.processAndSaveUrl(urls[index], {
+					openFile: false,
+					showNotices: false,
+				});
+				if (result) saved.set(urls[index], result);
+				else failed.push(urls[index]);
+			}
 
-      if (processedFiles.size > 0) {
-        await this.app.vault.process(activeFile, (latestContent) => {
-          let updatedContent = latestContent;
+			if (saved.size > 0) {
+				await this.app.vault.process(activeFile, (latest) => {
+					let updated = latest;
+					for (const match of extractSocialUrlMatches(latest)) {
+						const result = saved.get(match.canonicalUrl);
+						if (!result) continue;
+						const noteLink = this.app.fileManager.generateMarkdownLink(
+							result.file,
+							activeFile.path,
+							result.subpath,
+						);
+						const markdownLink = new RegExp(
+							`\\[([^\\]\\n]+)\\]\\(${escapeRegExp(match.raw)}\\)`,
+							"g",
+						);
+						updated = updated.replace(markdownLink, (_full, alias: string) =>
+							this.app.fileManager.generateMarkdownLink(
+								result.file,
+								activeFile.path,
+								result.subpath,
+								alias,
+							),
+						);
+						updated = updated.split(`<${match.raw}>`).join(noteLink);
+						updated = updated.split(match.raw).join(noteLink);
+					}
+					return updated;
+				});
+			}
+		} finally {
+			progress.hide();
+		}
 
-          for (const [url, savedFile] of processedFiles) {
-            const noteLink = this.app.fileManager.generateMarkdownLink(
-              savedFile,
-              activeFile.path
-            );
-            const markdownLinkPattern = new RegExp(
-              `\\[([^\\]\\n]+)\\]\\(${escapeRegExp(url)}\\)`,
-              "g"
-            );
+		new Notice(
+			failed.length === 0
+				? `Processed ${saved.size} social link(s).`
+				: `Processed ${saved.size}; ${failed.length} failed and remained unchanged.`,
+			8000,
+		);
+	}
 
-            updatedContent = updatedContent.replace(
-              markdownLinkPattern,
-              (_match, alias: string) =>
-                this.app.fileManager.generateMarkdownLink(
-                  savedFile,
-                  activeFile.path,
-                  undefined,
-                  alias
-                )
-            );
-            updatedContent = updatedContent
-              .split(`<${url}>`)
-              .join(noteLink);
-            updatedContent = updatedContent.split(url).join(noteLink);
-          }
+	async handleInsertAtCursor(editor: Editor): Promise<void> {
+		try {
+			const text = await navigator.clipboard.readText();
+			const url = extractAllSocialUrls(text)[0];
+			if (!url) {
+				new Notice(
+					"Clipboard does not contain a supported Threads or Instagram URL.",
+				);
+				return;
+			}
+			const post = await parseSocialPost(
+				url,
+				this.getSessionCookie(),
+				this.settings.customUserAgent,
+			);
+			editor.replaceSelection(
+				inlinePostMarkdown(
+					post.platform,
+					post.authorUsername,
+					post.content,
+					post.url,
+				),
+			);
+			new Notice("Social post inserted.");
+		} catch (error) {
+			new Notice(`Could not insert post: ${errorMessage(error)}`);
+		}
+	}
 
-          return updatedContent;
-        });
-      }
-    } catch (err) {
-      console.error("Bulk Threads processing stopped:", err);
-      new Notice(
-        "Bulk processing stopped before the active note could be fully updated.",
-        8000
-      );
-      return;
-    } finally {
-      progressNotice.hide();
-    }
+	async processAndReplaceLinkInEditor(
+		editor: Editor,
+		rawUrl: string,
+		canonicalUrl: string,
+		hasSelection: boolean,
+		lineNumber: number,
+	): Promise<void> {
+		try {
+			const post = await parseSocialPost(
+				canonicalUrl,
+				this.getSessionCookie(),
+				this.settings.customUserAgent,
+			);
+			const markdown = inlinePostMarkdown(
+				post.platform,
+				post.authorUsername,
+				post.content,
+				post.url,
+			);
+			if (hasSelection) {
+				editor.replaceSelection(markdown);
+			} else {
+				const line = editor.getLine(lineNumber);
+				const start = line.indexOf(rawUrl);
+				if (start < 0) throw new Error("The link moved before it was replaced.");
+				editor.replaceRange(
+					markdown.trimEnd(),
+					{ line: lineNumber, ch: start },
+					{ line: lineNumber, ch: start + rawUrl.length },
+				);
+			}
+			new Notice("Social post link converted.");
+		} catch (error) {
+			new Notice(`Could not convert link: ${errorMessage(error)}`);
+		}
+	}
 
-    const processedCount = processedFiles.size;
-    const failedCount = failedUrls.length;
-    const summary =
-      failedCount === 0
-        ? `Processed ${processedCount} Threads link(s).`
-        : `Processed ${processedCount} Threads link(s); ${failedCount} failed and remained unchanged.`;
+	async processAndSaveUrl(
+		url: string,
+		options: ProcessAndSaveOptions = {},
+	): Promise<SavedPostResult | null> {
+		const { openFile = true, showNotices = true } = options;
+		const parsed = parseSupportedSocialUrl(url);
+		if (!parsed) {
+			if (showNotices) new Notice("Unsupported or unsafe social URL.");
+			return null;
+		}
+		if (showNotices) {
+			new Notice(
+				`Fetching ${parsed.platform === "threads" ? "Threads" : "Instagram"} post…`,
+			);
+		}
 
-    new Notice(summary, 8000);
+		try {
+			const post = await parseSocialPost(
+				parsed.canonicalUrl,
+				this.getSessionCookie(),
+				this.settings.customUserAgent,
+			);
+			const result = await saveSocialPostToVault(
+				this.app,
+				post,
+				this.settings,
+			);
+			this.lastProcessedClipboardUrl = parsed.canonicalUrl;
+			if (openFile) {
+				await this.app.workspace.getLeaf(false).openFile(result.file);
+			}
+			if (showNotices) {
+				new Notice(
+					`Saved ${post.platform === "threads" ? "Threads" : "Instagram"} post.`,
+				);
+			}
+			return result;
+		} catch (error) {
+			console.error("Social Saver could not process the URL:", error);
+			if (showNotices) {
+				new Notice(`Could not save post: ${errorMessage(error)}`, 8000);
+			}
+			return null;
+		}
+	}
 
-    if (failedCount > 0) {
-      console.error("Failed bulk Threads URLs:", failedUrls);
-    }
-  }
-
-  /**
-   * Fetches Threads post and inserts Markdown at active editor cursor.
-   */
-  async handleInsertAtCursor(editor: Editor) {
-    try {
-      const text = await navigator.clipboard.readText();
-      const trimmed = text.trim();
-      const urls = extractAllThreadsUrls(trimmed);
-      if (urls.length === 0) {
-        new Notice("Clipboard does not contain a valid Threads URL.");
-        return;
-      }
-      new Notice("Fetching Threads post content...");
-      const post = await parseThreadsPost(urls[0], this.settings.sessionCookie, this.settings.customUserAgent);
-      const markdown = `> **@${post.authorUsername}**: ${post.content}\n> [Original Post](${post.url})\n`;
-      editor.replaceSelection(markdown);
-      new Notice("Inserted Threads post into note!");
-    } catch (err: any) {
-      new Notice(`Error inserting Threads post: ${err.message}`);
-    }
-  }
-
-  /**
-   * Processes a Threads URL and replaces it in current editor.
-   */
-  async processAndReplaceLinkInEditor(editor: Editor, url: string) {
-    new Notice("Fetching Threads post details...");
-    try {
-      const post = await parseThreadsPost(url, this.settings.sessionCookie, this.settings.customUserAgent);
-      const { content } = await generateThreadsNoteContent(this.app, post, this.settings);
-      editor.replaceSelection(content);
-      new Notice("Converted Threads link into enriched content!");
-    } catch (err: any) {
-      new Notice(`Failed to convert link: ${err.message}`);
-    }
-  }
-
-  /**
-   * Fetches Threads post and saves to vault as a NEW note.
-   */
-  async processAndSaveUrl(
-    url: string,
-    options: ProcessAndSaveOptions = {}
-  ): Promise<TFile | null> {
-    const { openFile = true, showNotices = true } = options;
-    if (showNotices) {
-      new Notice("Fetching Threads post details...");
-    }
-
-    try {
-      const post = await parseThreadsPost(url, this.settings.sessionCookie, this.settings.customUserAgent);
-      const savedFile = await saveThreadsPostToVault(
-        this.app,
-        post,
-        this.settings,
-        { showNotice: showNotices }
-      );
-      this.lastProcessedClipboardUrl = url;
-
-      if (openFile) {
-        const leaf = this.app.workspace.getLeaf(false);
-        await leaf.openFile(savedFile);
-      }
-
-      return savedFile;
-    } catch (err: any) {
-      console.error("Error processing Threads URL:", err);
-      if (showNotices) {
-        new Notice(`Failed to save Threads post: ${err.message || err}`);
-      }
-      return null;
-    }
-  }
-
-  /**
-   * Shows an interactive toast notice when a Threads link is detected in clipboard on app focus.
-   */
-  private showClipboardNotice(url: string) {
-    const noticeEl = new Notice("", 8000);
-    const container = noticeEl.noticeEl.createDiv({ cls: "threads-notice-container" });
-
-    const titleEl = container.createDiv({ cls: "threads-notice-title" });
-    titleEl.setText("📌 Threads link detected in clipboard!");
-
-    const actionsEl = container.createDiv({ cls: "threads-notice-actions" });
-
-    const saveBtn = actionsEl.createEl("button", {
-      text: "Save to Vault",
-      cls: "threads-btn-primary",
-    });
-
-    const ignoreBtn = actionsEl.createEl("button", {
-      text: "Ignore",
-      cls: "threads-btn-secondary",
-    });
-
-    saveBtn.addEventListener("click", async () => {
-      noticeEl.hide();
-      await this.processAndSaveUrl(url);
-    });
-
-    ignoreBtn.addEventListener("click", () => {
-      this.lastProcessedClipboardUrl = url;
-      noticeEl.hide();
-    });
-  }
+	private showClipboardNotice(url: string): void {
+		const parsed = parseSupportedSocialUrl(url);
+		if (!parsed) return;
+		const platform = parsed.platform === "threads" ? "Threads" : "Instagram";
+		const notice = new Notice("", 8000);
+		const container = notice.noticeEl.createDiv({
+			cls: "threads-notice-container",
+		});
+		container
+			.createDiv({ cls: "threads-notice-title" })
+			.setText(`${platform} link detected in clipboard`);
+		const actions = container.createDiv({ cls: "threads-notice-actions" });
+		const save = actions.createEl("button", {
+			text: "Save to vault",
+			cls: "threads-btn-primary",
+		});
+		const ignore = actions.createEl("button", {
+			text: "Ignore",
+			cls: "threads-btn-secondary",
+		});
+		save.addEventListener("click", () => {
+			notice.hide();
+			void this.processAndSaveUrl(parsed.canonicalUrl);
+		});
+		ignore.addEventListener("click", () => {
+			this.lastProcessedClipboardUrl = parsed.canonicalUrl;
+			notice.hide();
+		});
+	}
 }

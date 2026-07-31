@@ -1,32 +1,45 @@
 {
   "name": "obsidian-threads-saver",
-  "version": "1.0.3",
-  "description": "Save Instagram Threads posts into formatted Markdown notes inside Obsidian, optimized for mobile and desktop.",
+  "version": "1.1.0",
+  "description": "Archive Threads and Instagram posts, carousels, and Reels as safe Markdown notes in Obsidian.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "node esbuild.config.mjs production"
+    "build": "node esbuild.config.mjs production",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "node tests/run.mjs",
+    "check": "npm run typecheck && npm run lint && npm test && npm run build"
   },
   "keywords": [
     "obsidian",
     "obsidian-plugin",
     "threads",
-    "instagram-threads",
+    "instagram",
+    "reels",
+    "social-archive",
     "saver",
     "mobile"
   ],
   "author": "Oguzhan-Ozpinar",
   "license": "MIT",
+  "engines": {
+    "node": ">=20.19"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Oguzhan-Ozpinar/obsidian-threads-saver.git"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^20.11.0",
     "builtin-modules": "^3.3.0",
-    "esbuild": "0.19.11",
-    "obsidian": "latest",
+    "esbuild": "0.28.1",
+    "eslint": "^10.8.0",
+    "globals": "^17.8.0",
+    "obsidian": "1.13.1",
     "tslib": "2.6.2",
-    "typescript": "5.3.3"
+    "typescript": "5.9.3",
+    "typescript-eslint": "^8.65.0"
   }
 }

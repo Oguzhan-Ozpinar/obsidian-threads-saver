@@ -25,17 +25,917 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // src/main.ts
 var main_exports = {};
 __export(main_exports, {
-  default: () => ThreadsSaverPlugin
+  default: () => SocialSaverPlugin
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian4 = require("obsidian");
 
+// src/downloader.ts
+var import_obsidian = require("obsidian");
+
+// src/security.ts
+var THREADS_HOSTS = /* @__PURE__ */ new Set([
+  "threads.net",
+  "www.threads.net",
+  "threads.com",
+  "www.threads.com"
+]);
+var INSTAGRAM_HOSTS = /* @__PURE__ */ new Set([
+  "instagram.com",
+  "www.instagram.com",
+  "instagr.am",
+  "www.instagr.am"
+]);
+var MEDIA_HOST_SUFFIXES = ["cdninstagram.com", "fbcdn.net"];
+var ID_PATTERN = /^[A-Za-z0-9_.-]+$/;
+var USERNAME_PATTERN = /^[A-Za-z0-9._]+$/;
+function safeUrl(value) {
+  try {
+    if (/[\u0000-\u001F\u007F]/.test(value)) return null;
+    const url = new URL(value.trim());
+    if (url.protocol !== "https:" || url.username || url.password || url.port) {
+      return null;
+    }
+    return url;
+  } catch {
+    return null;
+  }
+}
+function parseSupportedSocialUrl(value) {
+  const url = safeUrl(value);
+  if (!url) return null;
+  const hostname = url.hostname.toLowerCase();
+  const segments = url.pathname.split("/").filter(Boolean);
+  if (THREADS_HOSTS.has(hostname)) {
+    let id;
+    let username;
+    let kind = "post";
+    if (segments.length === 3 && segments[0].startsWith("@") && segments[1] === "post") {
+      username = segments[0].slice(1);
+      id = segments[2];
+      if (!USERNAME_PATTERN.test(username)) return null;
+    } else if (segments.length === 2 && (segments[0] === "t" || segments[0] === "share")) {
+      kind = segments[0];
+      id = segments[1];
+    }
+    if (!id || !ID_PATTERN.test(id)) return null;
+    const path = username ? `/@${username}/post/${id}` : `/${kind}/${id}`;
+    return {
+      platform: "threads",
+      canonicalUrl: `https://www.threads.com${path}`,
+      id,
+      kind,
+      username
+    };
+  }
+  if (INSTAGRAM_HOSTS.has(hostname)) {
+    let kind;
+    let id;
+    if (segments.length === 2 && ["p", "reel", "reels", "tv"].includes(segments[0])) {
+      kind = segments[0] === "reels" ? "reel" : segments[0];
+      id = segments[1];
+    } else if (segments.length === 3 && segments[0] === "share" && segments[1] === "p") {
+      kind = "share";
+      id = segments[2];
+    }
+    if (!kind || !id || !ID_PATTERN.test(id)) return null;
+    const path = kind === "share" ? `/share/p/${id}` : `/${kind}/${id}`;
+    return {
+      platform: "instagram",
+      canonicalUrl: `https://www.instagram.com${path}`,
+      id,
+      kind
+    };
+  }
+  return null;
+}
+function trimUrlPunctuation(candidate) {
+  return candidate.replace(/[.,;:!?]+$/g, "").replace(/\)+$/g, (closing) => {
+    const openingCount = (candidate.match(/\(/g) ?? []).length;
+    const closingCount = (candidate.match(/\)/g) ?? []).length;
+    return closing.slice(0, Math.max(0, closingCount - openingCount));
+  });
+}
+function extractSocialUrlMatches(text) {
+  const candidates = text.match(/https?:\/\/[^\s<>"'`)\]}]+/gi) ?? [];
+  const matches = [];
+  for (const candidate of candidates) {
+    const raw = trimUrlPunctuation(candidate);
+    const parsed = parseSupportedSocialUrl(raw);
+    if (parsed) {
+      matches.push({
+        raw,
+        canonicalUrl: parsed.canonicalUrl,
+        platform: parsed.platform
+      });
+    }
+  }
+  return matches;
+}
+function extractAllSocialUrls(text) {
+  return [
+    ...new Set(
+      extractSocialUrlMatches(text).map((match) => match.canonicalUrl)
+    )
+  ];
+}
+function hostnameMatchesSuffix(hostname, suffix) {
+  return hostname === suffix || hostname.endsWith(`.${suffix}`);
+}
+function validateMediaUrl(value) {
+  const url = safeUrl(value);
+  if (!url) return null;
+  const hostname = url.hostname.toLowerCase();
+  const isPlatformHost = THREADS_HOSTS.has(hostname) || INSTAGRAM_HOSTS.has(hostname);
+  const isCdnHost = MEDIA_HOST_SUFFIXES.some(
+    (suffix) => hostnameMatchesSuffix(hostname, suffix)
+  );
+  return isPlatformHost || isCdnHost ? url : null;
+}
+function escapeHtml(value) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+}
+function escapeMarkdownText(value) {
+  return value.replace(/\\/g, "\\\\").replace(/([`*_{}[\]<>#+.!|~-])/g, "\\$1").replace(/\r?\n/g, " ");
+}
+function escapeMarkdownUrl(value) {
+  return value.replace(/\\/g, "%5C").replace(/\(/g, "%28").replace(/\)/g, "%29");
+}
+function yamlString(value) {
+  const normalized = value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+  return JSON.stringify(normalized);
+}
+function sanitizeFileName(value, fallback = "saved-post") {
+  const sanitized = value.normalize("NFC").replace(/[\\/:*?"<>|#^[\]]/g, "-").replace(/[\u0000-\u001F\u007F]/g, "").replace(/\s+/g, " ").replace(/[. ]+$/g, "").trim().slice(0, 120);
+  return sanitized || fallback;
+}
+function sanitizeTag(value) {
+  return value.trim().replace(/^#+/, "").replace(/[\s,#[\]]+/g, "-").replace(/[^A-Za-z0-9_\-/À-ÖØ-öø-ÿğüşöçıİĞÜŞÖÇ]/g, "").replace(/-+/g, "-").replace(/^[-/]+|[-/]+$/g, "");
+}
+
+// src/downloader.ts
+var MAX_MEDIA_ITEMS = 10;
+var MAX_MEDIA_BYTES = 20 * 1024 * 1024;
+var MAX_TOTAL_MEDIA_BYTES = 100 * 1024 * 1024;
+var DOWNLOAD_CONCURRENCY = 3;
+var MIME_EXTENSIONS = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "video/mp4": "mp4"
+};
+function safeVaultPath(value, allowEmpty = false) {
+  const raw = value.trim().replace(/\\/g, "/");
+  if (!raw && allowEmpty) return "";
+  if (!raw || raw.startsWith("/") || raw.split("/").some((segment) => segment === "..")) {
+    throw new Error(`Unsafe vault path: ${value}`);
+  }
+  return (0, import_obsidian.normalizePath)(raw);
+}
+async function ensureFolderExists(app, folderPath) {
+  const normalized = safeVaultPath(folderPath, true);
+  if (!normalized || normalized === ".") return;
+  const segments = normalized.split("/").filter(Boolean);
+  let current = "";
+  for (const segment of segments) {
+    current = current ? `${current}/${segment}` : segment;
+    const existing = app.vault.getAbstractFileByPath(current);
+    if (!existing) {
+      await app.vault.createFolder(current);
+    } else if (!(existing instanceof import_obsidian.TFolder)) {
+      throw new Error(`A file blocks the folder path: ${current}`);
+    }
+  }
+}
+function getHeader(headers, name) {
+  const target = name.toLowerCase();
+  const entry = Object.entries(headers).find(
+    ([key]) => key.toLowerCase() === target
+  );
+  return entry?.[1];
+}
+function remoteMediaMarkdown(item, label) {
+  const safeUrl2 = escapeMarkdownUrl(item.url);
+  return item.type === "video" ? `[${escapeMarkdownText(label)}](${safeUrl2})` : `![${escapeMarkdownText(label)}](${safeUrl2})`;
+}
+async function downloadOneMedia(app, folder, job) {
+  const validUrl = validateMediaUrl(job.item.url);
+  if (!validUrl) {
+    return {
+      fallbackEmbed: remoteMediaMarkdown(job.item, job.label),
+      byteLength: 0
+    };
+  }
+  try {
+    const response = await (0, import_obsidian.requestUrl)({
+      url: validUrl.toString(),
+      method: "GET",
+      throw: false
+    });
+    const contentLength = Number(
+      getHeader(response.headers, "content-length") ?? "0"
+    );
+    if (response.status !== 200 || Number.isFinite(contentLength) && contentLength > MAX_MEDIA_BYTES || response.arrayBuffer.byteLength > MAX_MEDIA_BYTES) {
+      return {
+        fallbackEmbed: remoteMediaMarkdown(job.item, job.label),
+        byteLength: 0
+      };
+    }
+    const rawContentType = getHeader(response.headers, "content-type")?.split(";")[0].trim() ?? "";
+    const extension = MIME_EXTENSIONS[rawContentType];
+    const expectedPrefix = job.item.type === "video" ? "video/" : "image/";
+    if (!extension || !rawContentType.startsWith(expectedPrefix)) {
+      return {
+        fallbackEmbed: remoteMediaMarkdown(job.item, job.label),
+        byteLength: 0
+      };
+    }
+    const filePath = (0, import_obsidian.normalizePath)(
+      `${folder}/${sanitizeFileName(job.fileStem)}.${extension}`
+    );
+    const existing = app.vault.getAbstractFileByPath(filePath);
+    if (existing instanceof import_obsidian.TFile) {
+      return {
+        fallbackEmbed: remoteMediaMarkdown(job.item, job.label),
+        existingEmbed: `![[${filePath}]]`,
+        byteLength: 0
+      };
+    }
+    if (existing) {
+      return {
+        fallbackEmbed: remoteMediaMarkdown(job.item, job.label),
+        byteLength: 0
+      };
+    }
+    return {
+      fallbackEmbed: remoteMediaMarkdown(job.item, job.label),
+      filePath,
+      binary: response.arrayBuffer,
+      byteLength: response.arrayBuffer.byteLength
+    };
+  } catch {
+    return {
+      fallbackEmbed: remoteMediaMarkdown(job.item, job.label),
+      byteLength: 0
+    };
+  }
+}
+function mediaJobs(post, settings) {
+  const jobs = [];
+  const append = (items, prefix) => {
+    for (const item of items) {
+      if (item.type === "video" && !settings.downloadVideos) continue;
+      const index = jobs.length + 1;
+      jobs.push({
+        item,
+        label: `${item.type === "video" ? "Video" : "Image"} ${index}`,
+        fileStem: `${post.platform}_${post.id}_${prefix}_${index}`
+      });
+      if (jobs.length >= MAX_MEDIA_ITEMS) return;
+    }
+  };
+  append(post.media, "post");
+  if (settings.unrollThreadChain && post.replyChain) {
+    for (let index = 0; index < post.replyChain.length; index += 1) {
+      append(post.replyChain[index].media, `reply_${index + 1}`);
+      if (jobs.length >= MAX_MEDIA_ITEMS) break;
+    }
+  }
+  return jobs;
+}
+async function renderMedia(app, post, settings) {
+  if (!settings.includeMedia) return [];
+  const jobs = mediaJobs(post, settings);
+  if (!settings.downloadMediaLocally) {
+    return jobs.map((job) => remoteMediaMarkdown(job.item, job.label));
+  }
+  const folder = safeVaultPath(
+    `${settings.attachmentsFolder}/${post.platform}`
+  );
+  await ensureFolderExists(app, folder);
+  const embeds = [];
+  let totalBytes = 0;
+  for (let start = 0; start < jobs.length; start += DOWNLOAD_CONCURRENCY) {
+    const batch = jobs.slice(start, start + DOWNLOAD_CONCURRENCY);
+    if (totalBytes >= MAX_TOTAL_MEDIA_BYTES) {
+      embeds.push(
+        ...jobs.slice(start).map((job) => remoteMediaMarkdown(job.item, job.label))
+      );
+      break;
+    }
+    const results = await Promise.all(
+      batch.map((job) => downloadOneMedia(app, folder, job))
+    );
+    for (let index = 0; index < results.length; index += 1) {
+      const result = results[index];
+      if (result.existingEmbed) {
+        embeds.push(result.existingEmbed);
+        continue;
+      }
+      if (totalBytes + result.byteLength > MAX_TOTAL_MEDIA_BYTES) {
+        embeds.push(result.fallbackEmbed);
+        continue;
+      }
+      if (result.binary && result.filePath) {
+        try {
+          await app.vault.createBinary(result.filePath, result.binary);
+          totalBytes += result.byteLength;
+          embeds.push(`![[${result.filePath}]]`);
+        } catch {
+          embeds.push(result.fallbackEmbed);
+        }
+      } else {
+        embeds.push(result.fallbackEmbed);
+      }
+    }
+  }
+  return embeds;
+}
+function quoteMarkdown(value) {
+  return value.split(/\r?\n/).map((line) => `> ${escapeMarkdownText(line)}`).join("\n");
+}
+function formatReplyChain(post) {
+  if (!post.replyChain?.length) return "";
+  const total = post.replyChain.length + 1;
+  const lines = [
+    "### Thread chain",
+    "",
+    `#### 1/${total} @${escapeMarkdownText(post.authorUsername)}`,
+    quoteMarkdown(post.content)
+  ];
+  for (let index = 0; index < post.replyChain.length; index += 1) {
+    const reply = post.replyChain[index];
+    lines.push(
+      "",
+      `#### ${index + 2}/${total} @${escapeMarkdownText(reply.authorUsername)}`,
+      quoteMarkdown(reply.content)
+    );
+  }
+  return lines.join("\n");
+}
+function renderVisualPostCard(post, formattedDate, unroll) {
+  const replies = unroll ? post.replyChain ?? [] : [];
+  const total = replies.length + 1;
+  const platformLabel = post.platform === "threads" ? "Threads" : "Instagram";
+  const cards = [
+    '<div class="threads-thread-container">',
+    '  <div class="threads-card">',
+    '    <div class="threads-card-header">',
+    '      <div class="threads-card-user">',
+    `        <span class="threads-card-name">${escapeHtml(post.authorName)}</span>`,
+    `        <span class="threads-card-username">@${escapeHtml(post.authorUsername)}${total > 1 ? ` \u2022 1/${total}` : ""}</span>`,
+    "      </div>",
+    `      <span class="threads-card-badge">${platformLabel}</span>`,
+    "    </div>",
+    `    <div class="threads-card-body">${escapeHtml(post.content).replace(/\r?\n/g, "<br>")}</div>`,
+    '    <div class="threads-card-footer">',
+    `      <span>${escapeHtml(formattedDate)}</span>`,
+    `      <a class="threads-card-link" href="${escapeHtml(post.url)}">Original post \u2197</a>`,
+    "    </div>",
+    "  </div>"
+  ];
+  for (let index = 0; index < replies.length; index += 1) {
+    const reply = replies[index];
+    cards.push(
+      '  <div class="threads-thread-line"></div>',
+      '  <div class="threads-card threads-card-reply">',
+      '    <div class="threads-card-header">',
+      '      <div class="threads-card-user">',
+      `        <span class="threads-card-name">${escapeHtml(reply.authorName)}</span>`,
+      `        <span class="threads-card-username">@${escapeHtml(reply.authorUsername)} \u2022 ${index + 2}/${total}</span>`,
+      "      </div>",
+      "    </div>",
+      `    <div class="threads-card-body">${escapeHtml(reply.content).replace(/\r?\n/g, "<br>")}</div>`,
+      "  </div>"
+    );
+  }
+  cards.push("</div>");
+  return cards.join("\n");
+}
+function replaceTemplate(template, values) {
+  return template.replace(
+    /\{\{([a-z0-9_]+)\}\}/gi,
+    (match, key) => Object.prototype.hasOwnProperty.call(values, key) ? values[key] : match
+  );
+}
+async function generateSocialNoteContent(app, post, settings) {
+  const media = await renderMedia(app, post, settings);
+  const date = post.timestamp ? new Date(post.timestamp).toISOString().split("T")[0] : (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+  const savedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const tags = [
+    ...settings.tags.map(sanitizeTag),
+    sanitizeTag(`${post.platform}/${post.authorUsername}`)
+  ].filter(Boolean);
+  const hasThread = Boolean(
+    settings.unrollThreadChain && post.replyChain?.length
+  );
+  const values = {
+    platform: post.platform,
+    platform_yaml: yamlString(post.platform),
+    id: post.id,
+    id_yaml: yamlString(post.id),
+    author_name: escapeMarkdownText(post.authorName),
+    author_display_yaml: yamlString(post.authorName),
+    author_username: escapeMarkdownText(post.authorUsername),
+    author_username_yaml: yamlString(post.authorUsername),
+    url: escapeMarkdownUrl(post.url),
+    url_yaml: yamlString(post.url),
+    date,
+    date_yaml: yamlString(date),
+    saved_at: savedAt,
+    tags: tags.map((tag) => `  - ${yamlString(tag)}`).join("\n"),
+    visual_card: settings.useVisualCard ? renderVisualPostCard(post, date, settings.unrollThreadChain) : "",
+    content: settings.useVisualCard || hasThread ? "" : quoteMarkdown(post.content),
+    media: media.length > 0 ? `### Media
+
+${media.join("\n\n")}` : "",
+    reply_chain: settings.unrollThreadChain ? formatReplyChain(post) : ""
+  };
+  const rawTitle = replaceTemplate(settings.noteTitleTemplate, {
+    platform: post.platform,
+    author_username: post.authorUsername,
+    author_name: post.authorName,
+    id: post.id
+  });
+  const content = replaceTemplate(settings.noteBodyTemplate, values).replace(/\n{3,}/g, "\n\n").trim().concat("\n");
+  return {
+    title: sanitizeFileName(rawTitle, `${post.platform}-${post.id}`),
+    content
+  };
+}
+function marker(platform, id, side) {
+  return `<!-- social-saver:${platform}:${id}:${side} -->`;
+}
+function wrapManagedContent(post, content) {
+  const start = marker(post.platform, post.id, "start");
+  const end = marker(post.platform, post.id, "end");
+  if (!content.startsWith("---\n")) {
+    return `${start}
+${content.trim()}
+${end}
+`;
+  }
+  const frontmatterEnd = content.indexOf("\n---", 4);
+  if (frontmatterEnd < 0) {
+    return `${start}
+${content.trim()}
+${end}
+`;
+  }
+  const splitAt = frontmatterEnd + 4;
+  return `${content.slice(0, splitAt)}
+${start}
+${content.slice(splitAt).trim()}
+${end}
+`;
+}
+function stripFrontmatter(content) {
+  if (!content.startsWith("---\n")) return content.trim();
+  const end = content.indexOf("\n---", 4);
+  return end < 0 ? content.trim() : content.slice(end + 4).trim();
+}
+function replaceManagedBlock(existing, post, block) {
+  const start = marker(post.platform, post.id, "start");
+  const end = marker(post.platform, post.id, "end");
+  const startIndex = existing.indexOf(start);
+  const endIndex = existing.indexOf(end, startIndex + start.length);
+  if (startIndex < 0 || endIndex < 0) return null;
+  return `${existing.slice(0, startIndex)}${block}${existing.slice(endIndex + end.length)}`;
+}
+function destinationFor(post, settings) {
+  if (post.platform === "threads") {
+    return {
+      mode: settings.threadsSaveMode,
+      folder: settings.threadsFolder,
+      targetFile: settings.threadsTargetFile
+    };
+  }
+  return {
+    mode: settings.instagramSaveMode,
+    folder: settings.instagramFolder,
+    targetFile: settings.instagramTargetFile
+  };
+}
+async function nextAvailablePath(app, folder, title) {
+  const base = (0, import_obsidian.normalizePath)(`${folder}/${title}.md`);
+  if (!app.vault.getAbstractFileByPath(base)) return base;
+  for (let index = 2; index < 1e4; index += 1) {
+    const candidate = (0, import_obsidian.normalizePath)(`${folder}/${title} ${index}.md`);
+    if (!app.vault.getAbstractFileByPath(candidate)) return candidate;
+  }
+  throw new Error("Could not find an available note filename.");
+}
+async function saveSocialPostToVault(app, post, settings) {
+  const destination = destinationFor(post, settings);
+  const generated = await generateSocialNoteContent(app, post, settings);
+  if (destination.mode === "single-file") {
+    const targetPath = safeVaultPath(
+      destination.targetFile.toLowerCase().endsWith(".md") ? destination.targetFile : `${destination.targetFile}.md`
+    );
+    const parent = targetPath.includes("/") ? targetPath.slice(0, targetPath.lastIndexOf("/")) : "";
+    await ensureFolderExists(app, parent);
+    const heading = `${generated.title} (${post.id})`;
+    const managedBlock = `${marker(post.platform, post.id, "start")}
+## ${heading}
+
+${stripFrontmatter(generated.content)}
+${marker(post.platform, post.id, "end")}`;
+    const existingTarget = app.vault.getAbstractFileByPath(targetPath);
+    let file;
+    if (!existingTarget) {
+      const platformLabel = post.platform === "threads" ? "Threads" : "Instagram";
+      file = await app.vault.create(
+        targetPath,
+        `# ${platformLabel} archive
+
+${managedBlock}
+`
+      );
+    } else if (existingTarget instanceof import_obsidian.TFile) {
+      file = existingTarget;
+      await app.vault.process(existingTarget, (existing) => {
+        const replaced = replaceManagedBlock(existing, post, managedBlock);
+        return replaced ?? `${existing.trimEnd()}
+
+${managedBlock}
+`;
+      });
+    } else {
+      throw new Error(`The target path is not a Markdown file: ${targetPath}`);
+    }
+    return { file, subpath: `#${heading}` };
+  }
+  await ensureFolderExists(app, destination.folder);
+  const preferredPath = safeVaultPath(
+    `${destination.folder}/${generated.title}.md`
+  );
+  const managed = wrapManagedContent(post, generated.content);
+  const preferred = app.vault.getAbstractFileByPath(preferredPath);
+  if (preferred instanceof import_obsidian.TFile) {
+    const existing = await app.vault.read(preferred);
+    if (existing.includes(marker(post.platform, post.id, "start")) && existing.includes(marker(post.platform, post.id, "end"))) {
+      await app.vault.process(preferred, () => managed);
+      return { file: preferred };
+    }
+  }
+  const identityTitle = sanitizeFileName(
+    `${generated.title} - ${post.platform}-${post.id}`
+  );
+  const identityPath = safeVaultPath(
+    `${destination.folder}/${identityTitle}.md`
+  );
+  const identityFile = app.vault.getAbstractFileByPath(identityPath);
+  if (identityFile instanceof import_obsidian.TFile) {
+    const existing = await app.vault.read(identityFile);
+    if (existing.includes(marker(post.platform, post.id, "start")) && existing.includes(marker(post.platform, post.id, "end"))) {
+      await app.vault.process(identityFile, () => managed);
+      return { file: identityFile };
+    }
+  } else if (!identityFile) {
+    return { file: await app.vault.create(identityPath, managed) };
+  }
+  const path = await nextAvailablePath(
+    app,
+    destination.folder,
+    identityTitle
+  );
+  return { file: await app.vault.create(path, managed) };
+}
+
+// src/parser.ts
+var import_obsidian2 = require("obsidian");
+var DEFAULT_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+var MAX_HTML_BYTES = 10 * 1024 * 1024;
+var MAX_JSON_BYTES = 2 * 1024 * 1024;
+var MAX_JSON_SCRIPTS = 40;
+var MAX_JSON_NODES = 12e3;
+var MAX_JSON_DEPTH = 35;
+var MAX_MEDIA_ITEMS2 = 10;
+function isObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function asObject(value) {
+  return isObject(value) ? value : null;
+}
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+function asString(value) {
+  return typeof value === "string" ? value : "";
+}
+function asNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : void 0;
+}
+function getPath(root, ...keys) {
+  let current = root;
+  for (const key of keys) {
+    const object = asObject(current);
+    if (!object) return void 0;
+    current = object[key];
+  }
+  return current;
+}
+function normalizeSessionCookie(value) {
+  if (!value) return void 0;
+  const trimmed = value.trim();
+  if (!trimmed || /[\r\n]/.test(trimmed)) return void 0;
+  const match = trimmed.match(/(?:^|;\s*)sessionid=([^;\s]+)/i);
+  const token = match?.[1] ?? trimmed;
+  if (!/^[A-Za-z0-9%._:-]+$/.test(token)) return void 0;
+  return `sessionid=${token}`;
+}
+function mediaKey(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.hostname.toLowerCase()}${parsed.pathname}`;
+  } catch {
+    return url;
+  }
+}
+function isLikelyPostImage(url) {
+  const lower = url.toLowerCase();
+  return !lower.includes("static.cdninstagram.com") && !lower.includes("rsrc.php") && !lower.includes("profile_pic") && !lower.includes("s150x150");
+}
+function createMediaCollector() {
+  const items = [];
+  const seen = /* @__PURE__ */ new Set();
+  return {
+    items,
+    add(url, type) {
+      if (items.length >= MAX_MEDIA_ITEMS2 || !url) return;
+      if (type === "image" && !isLikelyPostImage(url)) return;
+      const valid = validateMediaUrl(url);
+      if (!valid) return;
+      const key = `${type}:${mediaKey(valid.toString())}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      items.push({ url: valid.toString(), type });
+    }
+  };
+}
+function bestCandidateUrl(value) {
+  const candidates = asArray(value).map((item) => asObject(item)).filter((item) => item !== null).sort((a, b) => {
+    const aWidth = asNumber(a.width) ?? 0;
+    const bWidth = asNumber(b.width) ?? 0;
+    return bWidth - aWidth;
+  });
+  return asString(candidates[0]?.url);
+}
+function collectMediaFromObject(object, add) {
+  const carousel = asArray(object.carousel_media);
+  if (carousel.length > 0) {
+    for (const rawItem of carousel) {
+      const item = asObject(rawItem);
+      if (!item) continue;
+      const video2 = bestCandidateUrl(item.video_versions);
+      if (video2) add(video2, "video");
+      const image2 = bestCandidateUrl(
+        getPath(item, "image_versions2", "candidates")
+      );
+      if (image2) add(image2, "image");
+    }
+    return;
+  }
+  const video = bestCandidateUrl(object.video_versions);
+  if (video) add(video, "video");
+  const image = bestCandidateUrl(
+    getPath(object, "image_versions2", "candidates")
+  );
+  if (image) add(image, "image");
+}
+function walkJson(root, visitor) {
+  const stack = [
+    { value: root, depth: 0 }
+  ];
+  const ignoredKeys = /* @__PURE__ */ new Set([
+    "profile_pic_url",
+    "profile_pic_url_hd",
+    "suggested_users",
+    "user_recommendations",
+    "recs_feed",
+    "related_posts"
+  ]);
+  let visited = 0;
+  while (stack.length > 0 && visited < MAX_JSON_NODES) {
+    const current = stack.pop();
+    if (!current || current.depth > MAX_JSON_DEPTH) continue;
+    visited += 1;
+    if (Array.isArray(current.value)) {
+      for (let index = current.value.length - 1; index >= 0; index -= 1) {
+        stack.push({
+          value: current.value[index],
+          depth: current.depth + 1
+        });
+      }
+      continue;
+    }
+    const object = asObject(current.value);
+    if (!object) continue;
+    visitor(object);
+    for (const [key, value] of Object.entries(object)) {
+      if (!ignoredKeys.has(key) && typeof value === "object" && value) {
+        stack.push({ value, depth: current.depth + 1 });
+      }
+    }
+  }
+}
+function scorePostObject(object, id) {
+  let score = 0;
+  const objectId = asString(object.code) || asString(object.shortcode) || asString(object.pk) || asString(object.id);
+  if (objectId === id || objectId.startsWith(`${id}_`)) score += 100;
+  if (asString(getPath(object, "caption", "text"))) score += 20;
+  if (asString(getPath(object, "user", "username"))) score += 10;
+  if (asArray(object.carousel_media).length > 0) score += 10;
+  if (asArray(getPath(object, "image_versions2", "candidates")).length > 0)
+    score += 5;
+  if (asArray(object.video_versions).length > 0) score += 5;
+  return score;
+}
+function extractTimestamp(object) {
+  const seconds = asNumber(object.taken_at) ?? asNumber(object.device_timestamp) ?? asNumber(object.created_at);
+  if (!seconds) return void 0;
+  const milliseconds = seconds > 1e14 ? seconds / 1e3 : seconds > 1e10 ? seconds : seconds * 1e3;
+  const date = new Date(milliseconds);
+  return Number.isNaN(date.getTime()) ? void 0 : date.toISOString();
+}
+function getMeta(doc, property) {
+  const escaped = property.replace(/"/g, '\\"');
+  const element = doc.querySelector(
+    `meta[property="${escaped}"], meta[name="${escaped}"]`
+  );
+  return element?.getAttribute("content")?.trim() ?? "";
+}
+function cleanDescription(value, platform) {
+  let content = value.trim();
+  if (platform === "instagram") {
+    const quoted = content.match(
+      /(?:likes?|comments?).*?\s-\s[^:]+:\s*[“"]([\s\S]*?)[”"]\s*$/i
+    );
+    if (quoted?.[1]) content = quoted[1].trim();
+  }
+  return content;
+}
+function authorFromMeta(title, description, fallbackUsername) {
+  const usernameMatch = title.match(/\(@([A-Za-z0-9._]+)\)/) ?? description.match(/@([A-Za-z0-9._]+)/);
+  const username = usernameMatch?.[1] ?? fallbackUsername;
+  const nameCandidate = title.split(/[•|]/)[0].replace(/\(@[^)]+\)/, "").replace(/^@/, "").trim();
+  return {
+    name: nameCandidate || username || "Unknown author",
+    username: username || "unknown"
+  };
+}
+function parseReplyChain(jsonRoots, mainAuthor) {
+  const replies = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const root of jsonRoots) {
+    walkJson(root, (object) => {
+      const threadItems = asArray(object.thread_items);
+      if (threadItems.length < 2) return;
+      for (const rawItem of threadItems.slice(1)) {
+        const post = asObject(getPath(rawItem, "post")) ?? asObject(rawItem);
+        if (!post) continue;
+        const username = asString(getPath(post, "user", "username"));
+        if (mainAuthor && username && username.toLowerCase() !== mainAuthor.toLowerCase()) {
+          continue;
+        }
+        const content = asString(getPath(post, "caption", "text"));
+        const collector = createMediaCollector();
+        collectMediaFromObject(post, collector.add);
+        const replyId = asString(post.pk) || asString(post.id) || `${username}:${content}:${collector.items[0]?.url ?? ""}`;
+        if (seen.has(replyId) || !content && collector.items.length === 0) {
+          continue;
+        }
+        seen.add(replyId);
+        replies.push({
+          authorUsername: username || mainAuthor || "unknown",
+          authorName: asString(getPath(post, "user", "full_name")) || username || mainAuthor || "Unknown author",
+          content,
+          media: collector.items
+        });
+      }
+    });
+  }
+  return replies.slice(0, 20);
+}
+async function parseSocialPost(inputUrl, sessionCookie, userProvidedUserAgent) {
+  const parsedUrl = parseSupportedSocialUrl(inputUrl);
+  if (!parsedUrl) {
+    throw new Error("Unsupported or unsafe Threads/Instagram URL.");
+  }
+  const headers = {
+    "User-Agent": userProvidedUserAgent && userProvidedUserAgent.length <= 300 && !/\r|\n/.test(userProvidedUserAgent) ? userProvidedUserAgent.trim() : DEFAULT_USER_AGENT,
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9"
+  };
+  const cookie = normalizeSessionCookie(sessionCookie);
+  const requestPage = async (cookieHeader) => {
+    const requestHeaders = { ...headers };
+    if (cookieHeader) requestHeaders.Cookie = cookieHeader;
+    const page = await (0, import_obsidian2.requestUrl)({
+      url: parsedUrl.canonicalUrl,
+      method: "GET",
+      headers: requestHeaders,
+      throw: false
+    });
+    if (page.status !== 200) {
+      throw new Error(
+        `${parsedUrl.platform === "threads" ? "Threads" : "Instagram"} returned HTTP ${page.status}.`
+      );
+    }
+    if (page.arrayBuffer.byteLength > MAX_HTML_BYTES) {
+      throw new Error("The post page exceeded the safe response-size limit.");
+    }
+    return page;
+  };
+  let response = await requestPage();
+  let doc = new DOMParser().parseFromString(response.text, "text/html");
+  let cookieWasSent = false;
+  const initialDescription = getMeta(doc, "og:description") || getMeta(doc, "twitter:description");
+  const initialImage = getMeta(doc, "og:image") || getMeta(doc, "twitter:image");
+  const initialLooksLoggedOut = /Join Threads to share ideas|Log in with your Instagram/i.test(
+    initialDescription
+  ) || !initialDescription && !initialImage;
+  if (cookie && initialLooksLoggedOut && !["share", "t"].includes(parsedUrl.kind)) {
+    response = await requestPage(cookie);
+    doc = new DOMParser().parseFromString(response.text, "text/html");
+    cookieWasSent = true;
+  }
+  const title = getMeta(doc, "og:title") || getMeta(doc, "twitter:title");
+  const description = getMeta(doc, "og:description") || getMeta(doc, "twitter:description");
+  const ogImage = getMeta(doc, "og:image") || getMeta(doc, "twitter:image");
+  const ogVideo = getMeta(doc, "og:video:secure_url") || getMeta(doc, "og:video") || getMeta(doc, "twitter:player:stream");
+  const jsonRoots = [];
+  const scriptTags = Array.from(
+    doc.querySelectorAll('script[type="application/json"]')
+  ).slice(0, MAX_JSON_SCRIPTS);
+  for (const script of scriptTags) {
+    const scriptText = script.textContent?.trim();
+    if (!scriptText || new TextEncoder().encode(scriptText).byteLength > MAX_JSON_BYTES || !/(?:thread_items|carousel_media|image_versions2|video_versions|shortcode|caption)/.test(
+      scriptText
+    )) {
+      continue;
+    }
+    try {
+      jsonRoots.push(JSON.parse(scriptText));
+    } catch {
+    }
+  }
+  let bestPost = null;
+  let bestScore = 0;
+  for (const root of jsonRoots) {
+    walkJson(root, (object) => {
+      const score = scorePostObject(object, parsedUrl.id);
+      if (score > bestScore) {
+        bestScore = score;
+        bestPost = object;
+      }
+    });
+  }
+  const fallbackAuthor = authorFromMeta(
+    title,
+    description,
+    parsedUrl.username ?? ""
+  );
+  const postObject = bestPost;
+  const authorUsername = (postObject ? asString(getPath(postObject, "user", "username")) : "") || fallbackAuthor.username;
+  const authorName = (postObject ? asString(getPath(postObject, "user", "full_name")) : "") || fallbackAuthor.name;
+  const content = (postObject ? asString(getPath(postObject, "caption", "text")) : "") || cleanDescription(description, parsedUrl.platform) || "No text content found in post.";
+  const collector = createMediaCollector();
+  if (postObject) collectMediaFromObject(postObject, collector.add);
+  if (ogVideo) collector.add(ogVideo, "video");
+  if (ogImage) collector.add(ogImage, "image");
+  const genericLandingPage = /Join Threads to share ideas|Log in with your Instagram/i.test(content);
+  const missingPostData = !postObject && !description && !ogImage && !ogVideo;
+  if (genericLandingPage || missingPostData) {
+    throw new Error(
+      cookieWasSent ? "Meta returned a login page. The saved sessionid may be expired." : ["share", "t"].includes(parsedUrl.kind) ? "Meta returned a login page for a redirecting short/share link. Retry with the direct post URL." : "Meta returned a login page. Add a sessionid in Social Saver settings, then retry."
+    );
+  }
+  return {
+    platform: parsedUrl.platform,
+    id: parsedUrl.id,
+    url: parsedUrl.canonicalUrl,
+    authorName,
+    authorUsername,
+    content,
+    media: collector.items,
+    replyChain: parsedUrl.platform === "threads" ? parseReplyChain(jsonRoots, authorUsername) : void 0,
+    timestamp: (postObject ? extractTimestamp(postObject) : void 0) ?? (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+
+// src/settings.ts
+var import_obsidian3 = require("obsidian");
+
 // src/types.ts
 var DEFAULT_NOTE_BODY_TEMPLATE = `---
-author: "{{author_name}} (@{{author_username}})"
-username: "{{author_username}}"
-original_url: "{{url}}"
-date_saved: {{date}}
+platform: {{platform_yaml}}
+social_post_id: {{id_yaml}}
+author: {{author_display_yaml}}
+username: {{author_username_yaml}}
+original_url: {{url_yaml}}
+date_saved: {{date_yaml}}
 tags:
 {{tags}}
 ---
@@ -49,26 +949,30 @@ tags:
 {{reply_chain}}
 
 ---
-*Saved with [Threads Saver](https://github.com/Oguzhan-Ozpinar/obsidian-threads-saver) on {{saved_at}}*
+*Saved with Social Saver on {{saved_at}}*
 `;
 var DEFAULT_SETTINGS = {
-  notesFolder: "Threads",
-  attachmentsFolder: "attachments/threads",
+  threadsSaveMode: "folder",
+  instagramSaveMode: "folder",
+  threadsFolder: "Threads",
+  instagramFolder: "Instagram",
+  threadsTargetFile: "Threads.md",
+  instagramTargetFile: "Instagram.md",
+  attachmentsFolder: "attachments/social-saver",
   downloadMediaLocally: true,
+  downloadVideos: true,
   includeMedia: true,
-  clipboardAutoDetect: true,
+  clipboardAutoDetect: false,
   unrollThreadChain: true,
   useVisualCard: false,
-  noteTitleTemplate: "Threads - {{author_username}} - {{id}}",
+  noteTitleTemplate: "{{platform}} - {{author_username}} - {{id}}",
   noteBodyTemplate: DEFAULT_NOTE_BODY_TEMPLATE,
-  tags: ["threads"],
-  sessionCookie: "",
+  tags: ["social-archive"],
   customUserAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 };
 
 // src/settings.ts
-var import_obsidian = require("obsidian");
-var ThreadsSaverSettingTab = class extends import_obsidian.PluginSettingTab {
+var ThreadsSaverSettingTab = class extends import_obsidian3.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -76,756 +980,497 @@ var ThreadsSaverSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Threads Saver Settings" });
-    new import_obsidian.Setting(containerEl).setName("Session Cookie (sessionid)").setDesc("Threads.net requires a logged-in session cookie to fetch full post content and images. Open threads.net in browser -> Application/Storage -> Cookies -> copy 'sessionid' value.").addText(
-      (text) => text.setPlaceholder("e.g. 6428412345%3A...").setValue(this.plugin.settings.sessionCookie).onChange(async (value) => {
-        this.plugin.settings.sessionCookie = value.trim();
+    new import_obsidian3.Setting(containerEl).setName("Account access").setHeading();
+    new import_obsidian3.Setting(containerEl).setName("Meta session ID").setDesc(
+      "Optional. Used only for validated Threads and Instagram page requests. Stored in Obsidian's secret storage, not the plugin data file. Treat it like a password."
+    ).addText((text) => {
+      text.inputEl.type = "password";
+      text.setPlaceholder("sessionid value").setValue(this.plugin.getSessionCookie()).onChange((value) => {
+        this.plugin.setSessionCookie(value);
+      });
+    }).addExtraButton((button) => {
+      button.setIcon("eye").setTooltip("Show or hide session ID").onClick(() => {
+        const input = button.extraSettingsEl.parentElement?.querySelector(
+          'input[type="password"], input[type="text"]'
+        );
+        if (!input) return;
+        input.type = input.type === "password" ? "text" : "password";
+        button.setIcon(input.type === "password" ? "eye" : "eye-off");
+      });
+    });
+    new import_obsidian3.Setting(containerEl).setName("Threads destination").setHeading();
+    new import_obsidian3.Setting(containerEl).setName("Save mode").setDesc("Create one note per post, or maintain one managed archive file.").addDropdown(
+      (dropdown) => dropdown.addOption("folder", "One note per post").addOption("single-file", "Single archive file").setValue(this.plugin.settings.threadsSaveMode).onChange(async (value) => {
+        this.plugin.settings.threadsSaveMode = value === "single-file" ? "single-file" : "folder";
         await this.plugin.saveSettings();
+        this.display();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Visual Threads Card").setDesc("Render a styled HTML/CSS card in native Threads UI layout at the top of the note (default: OFF).").addToggle(
-      (toggle) => toggle.setValue(this.plugin.settings.useVisualCard).onChange(async (value) => {
-        this.plugin.settings.useVisualCard = value;
+    if (this.plugin.settings.threadsSaveMode === "folder") {
+      new import_obsidian3.Setting(containerEl).setName("Threads folder").setDesc("Vault folder for Threads notes.").addText(
+        (text) => text.setPlaceholder("Social/Threads").setValue(this.plugin.settings.threadsFolder).onChange(async (value) => {
+          this.plugin.settings.threadsFolder = value.trim() || "Social/Threads";
+          await this.plugin.saveSettings();
+        })
+      );
+    } else {
+      new import_obsidian3.Setting(containerEl).setName("Threads archive file").setDesc("Markdown file used as the managed Threads archive.").addText(
+        (text) => text.setPlaceholder("Social/Threads.md").setValue(this.plugin.settings.threadsTargetFile).onChange(async (value) => {
+          this.plugin.settings.threadsTargetFile = value.trim() || "Social/Threads.md";
+          await this.plugin.saveSettings();
+        })
+      );
+    }
+    new import_obsidian3.Setting(containerEl).setName("Instagram destination").setHeading();
+    new import_obsidian3.Setting(containerEl).setName("Save mode").setDesc("Create one note per post, or maintain one managed archive file.").addDropdown(
+      (dropdown) => dropdown.addOption("folder", "One note per post").addOption("single-file", "Single archive file").setValue(this.plugin.settings.instagramSaveMode).onChange(async (value) => {
+        this.plugin.settings.instagramSaveMode = value === "single-file" ? "single-file" : "folder";
         await this.plugin.saveSettings();
+        this.display();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Unroll Thread Chain").setDesc("Fetch and combine sequential reply posts written by the same author into a single unrolled note.").addToggle(
+    if (this.plugin.settings.instagramSaveMode === "folder") {
+      new import_obsidian3.Setting(containerEl).setName("Instagram folder").setDesc("Vault folder for Instagram posts and Reels.").addText(
+        (text) => text.setPlaceholder("Social/Instagram").setValue(this.plugin.settings.instagramFolder).onChange(async (value) => {
+          this.plugin.settings.instagramFolder = value.trim() || "Social/Instagram";
+          await this.plugin.saveSettings();
+        })
+      );
+    } else {
+      new import_obsidian3.Setting(containerEl).setName("Instagram archive file").setDesc("Markdown file used as the managed Instagram archive.").addText(
+        (text) => text.setPlaceholder("Social/Instagram.md").setValue(this.plugin.settings.instagramTargetFile).onChange(async (value) => {
+          this.plugin.settings.instagramTargetFile = value.trim() || "Social/Instagram.md";
+          await this.plugin.saveSettings();
+        })
+      );
+    }
+    new import_obsidian3.Setting(containerEl).setName("Content and media").setHeading();
+    new import_obsidian3.Setting(containerEl).setName("Unroll Threads chains").setDesc("Include sequential replies written by the original author.").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.unrollThreadChain).onChange(async (value) => {
         this.plugin.settings.unrollThreadChain = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Include Media").setDesc("Include post images and media attachments in saved notes.").addToggle(
+    new import_obsidian3.Setting(containerEl).setName("Include media").setDesc("Include supported post images and videos in saved notes.").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.includeMedia).onChange(async (value) => {
         this.plugin.settings.includeMedia = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Download Media Locally").setDesc("Download post images into your vault so image links never break when Instagram CDN links expire.").addToggle(
+    new import_obsidian3.Setting(containerEl).setName("Download media locally").setDesc("Copy supported media to the vault using size and MIME checks.").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.downloadMediaLocally).onChange(async (value) => {
         this.plugin.settings.downloadMediaLocally = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Clipboard Auto-Detect").setDesc("Show a quick Toast notification to save Threads link when switching back to Obsidian with a Threads URL in clipboard.").addToggle(
+    new import_obsidian3.Setting(containerEl).setName("Download videos").setDesc("Allow MP4 downloads for Instagram Reels and video posts.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.downloadVideos).onChange(async (value) => {
+        this.plugin.settings.downloadVideos = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian3.Setting(containerEl).setName("Attachments folder").setDesc("Platform subfolders are created below this vault folder.").addText(
+      (text) => text.setPlaceholder("attachments/social-saver").setValue(this.plugin.settings.attachmentsFolder).onChange(async (value) => {
+        this.plugin.settings.attachmentsFolder = value.trim() || "attachments/social-saver";
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian3.Setting(containerEl).setName("Visual post card").setDesc("Render escaped post text inside the bundled card style.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.useVisualCard).onChange(async (value) => {
+        this.plugin.settings.useVisualCard = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian3.Setting(containerEl).setName("Clipboard detection").setDesc(
+      "Check the clipboard when Obsidian regains focus and offer to save a supported link."
+    ).addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.clipboardAutoDetect).onChange(async (value) => {
         this.plugin.settings.clipboardAutoDetect = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Notes Folder").setDesc("Vault folder where saved Threads posts will be created as Markdown notes.").addText(
-      (text) => text.setPlaceholder("Threads").setValue(this.plugin.settings.notesFolder).onChange(async (value) => {
-        this.plugin.settings.notesFolder = value.trim() || "Threads";
+    new import_obsidian3.Setting(containerEl).setName("Templates").setHeading();
+    new import_obsidian3.Setting(containerEl).setName("Note title template").setDesc(
+      "Variables: {{platform}}, {{author_username}}, {{author_name}}, {{id}}"
+    ).addText(
+      (text) => text.setPlaceholder("{{platform}} - {{author_username}} - {{id}}").setValue(this.plugin.settings.noteTitleTemplate).onChange(async (value) => {
+        this.plugin.settings.noteTitleTemplate = value.trim() || "{{platform}} - {{author_username}} - {{id}}";
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Attachments Folder").setDesc("Vault folder where post images/media will be downloaded.").addText(
-      (text) => text.setPlaceholder("attachments/threads").setValue(this.plugin.settings.attachmentsFolder).onChange(async (value) => {
-        this.plugin.settings.attachmentsFolder = value.trim() || "attachments/threads";
-        await this.plugin.saveSettings();
-      })
-    );
-    new import_obsidian.Setting(containerEl).setName("Note Title Template").setDesc("Template for note titles. Variables: {{author_username}}, {{author_name}}, {{id}}").addText(
-      (text) => text.setPlaceholder("Threads - {{author_username}} - {{id}}").setValue(this.plugin.settings.noteTitleTemplate).onChange(async (value) => {
-        this.plugin.settings.noteTitleTemplate = value.trim() || "Threads - {{author_username}} - {{id}}";
-        await this.plugin.saveSettings();
-      })
-    );
-    new import_obsidian.Setting(containerEl).setName("Custom Note Body Template").setDesc("Customize the Markdown note layout. Variables: {{visual_card}}, {{author_name}}, {{author_username}}, {{url}}, {{date}}, {{saved_at}}, {{content}}, {{media}}, {{reply_chain}}, {{tags}}").addTextArea((text) => {
-      text.inputEl.rows = 8;
-      text.inputEl.cols = 50;
-      text.setValue(this.plugin.settings.noteBodyTemplate || DEFAULT_NOTE_BODY_TEMPLATE).onChange(async (value) => {
+    new import_obsidian3.Setting(containerEl).setName("Note body template").setDesc(
+      "Supports escaped display variables and dedicated *_yaml variables from the default template."
+    ).addTextArea((text) => {
+      text.inputEl.rows = 12;
+      text.inputEl.cols = 55;
+      text.setValue(
+        this.plugin.settings.noteBodyTemplate || DEFAULT_NOTE_BODY_TEMPLATE
+      ).onChange(async (value) => {
         this.plugin.settings.noteBodyTemplate = value;
         await this.plugin.saveSettings();
       });
     });
-    new import_obsidian.Setting(containerEl).setName("Tags").setDesc("Comma-separated list of default tags to add to saved notes.").addText(
-      (text) => text.setPlaceholder("threads, social").setValue(this.plugin.settings.tags.join(", ")).onChange(async (value) => {
-        this.plugin.settings.tags = value.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+    new import_obsidian3.Setting(containerEl).setName("Tags").setDesc("Comma-separated default tags.").addText(
+      (text) => text.setPlaceholder("social-archive").setValue(this.plugin.settings.tags.join(", ")).onChange(async (value) => {
+        this.plugin.settings.tags = value.split(",").map((tag) => tag.trim()).filter(Boolean);
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian3.Setting(containerEl).setName("Advanced").setHeading();
+    new import_obsidian3.Setting(containerEl).setName("Custom user agent").setDesc("Optional request user agent. Leave empty to use the built-in value.").addText(
+      (text) => text.setPlaceholder("Mozilla/5.0 \u2026").setValue(this.plugin.settings.customUserAgent).onChange(async (value) => {
+        this.plugin.settings.customUserAgent = value.trim();
         await this.plugin.saveSettings();
       })
     );
   }
 };
 
-// src/parser.ts
-var import_obsidian2 = require("obsidian");
-function extractThreadsPostId(url) {
-  try {
-    const cleanUrl = url.trim();
-    const postMatch = cleanUrl.match(/threads\.(net|com)\/@([a-zA-Z0-9_.-]+)\/post\/([a-zA-Z0-9_.-]+)/i);
-    if (postMatch) {
-      return { username: postMatch[2], postId: postMatch[3] };
-    }
-    const shortMatch = cleanUrl.match(/threads\.(net|com)\/t\/([a-zA-Z0-9_.-]+)/i);
-    if (shortMatch) {
-      return { postId: shortMatch[2] };
-    }
-    const shareMatch = cleanUrl.match(/threads\.(net|com)\/share\/([a-zA-Z0-9_.-]+)/i);
-    if (shareMatch) {
-      return { shareId: shareMatch[2] };
-    }
-    return null;
-  } catch (err) {
-    console.error("Error extracting Threads post ID:", err);
-    return null;
-  }
-}
-function getImageKey(url) {
-  try {
-    const u = new URL(url);
-    return u.pathname.toLowerCase();
-  } catch {
-    return url.split("?")[0].toLowerCase();
-  }
-}
-function isMainPostImage(url) {
-  if (!url)
-    return false;
-  if (url.includes("static.cdninstagram.com") || url.includes("rsrc.php"))
-    return false;
-  if (url.includes("s150x150") || url.includes("s320x320") || url.includes("profile_pic"))
-    return false;
-  return true;
-}
-async function parseThreadsPost(url, sessionCookie, userProvidedUserAgent) {
-  const extracted = extractThreadsPostId(url);
-  if (!extracted) {
-    throw new Error("Invalid Threads URL format.");
-  }
-  const targetUrl = url.trim();
-  const fallbackId = extracted.postId || extracted.shareId || Date.now().toString();
-  const headers = {
-    "User-Agent": userProvidedUserAgent || "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin"
-  };
-  if (sessionCookie && sessionCookie.trim()) {
-    const cleanCookie = sessionCookie.trim();
-    headers["Cookie"] = cleanCookie.includes("sessionid=") ? cleanCookie : `sessionid=${cleanCookie}`;
-  }
-  const response = await (0, import_obsidian2.requestUrl)({
-    url: targetUrl,
-    method: "GET",
-    headers
-  });
-  if (response.status !== 200) {
-    throw new Error(`Failed to fetch Threads post (HTTP ${response.status}).`);
-  }
-  const html = response.text;
-  const domParser = new DOMParser();
-  const doc = domParser.parseFromString(html, "text/html");
-  const getMeta = (property) => {
-    const el = doc.querySelector(`meta[property="${property}"], meta[name="${property}"]`);
-    return el ? el.getAttribute("content") || "" : "";
-  };
-  let ogTitle = getMeta("og:title") || getMeta("twitter:title");
-  let ogDescription = getMeta("og:description") || getMeta("twitter:description");
-  let ogImage = getMeta("og:image") || getMeta("twitter:image");
-  let authorUsername = extracted.username || "";
-  let authorName = authorUsername ? `@${authorUsername}` : "Threads User";
-  let content = ogDescription;
-  const isGenericLandingPage = content.includes("Join Threads to share ideas") || content.includes("Log in with your Instagram") || !content.trim();
-  if (isGenericLandingPage && (!sessionCookie || !sessionCookie.trim())) {
-    throw new Error(
-      "Meta Threads blocked unauthenticated fetch. Please add your sessionid cookie in Threads Saver plugin settings to fetch post content!"
-    );
-  }
-  if (ogTitle) {
-    const titleMatch = ogTitle.match(/([^•]+)(?:•|\(@([a-zA-Z0-9_.-]+)\))/i);
-    if (titleMatch && titleMatch[1]) {
-      authorName = titleMatch[1].trim();
-    }
-  }
-  const mediaUrls = [];
-  const seenKeys = /* @__PURE__ */ new Set();
-  const addMediaUrl = (imgUrl) => {
-    if (!imgUrl || !isMainPostImage(imgUrl))
-      return;
-    const key = getImageKey(imgUrl);
-    if (!seenKeys.has(key)) {
-      seenKeys.add(key);
-      mediaUrls.push(imgUrl);
-    }
-  };
-  const replyChain = [];
-  const scriptTags = Array.from(doc.querySelectorAll('script[type="application/json"]'));
-  for (const script of scriptTags) {
-    const scriptText = script.textContent;
-    if (!scriptText)
-      continue;
-    try {
-      if (scriptText.includes("thread_items") || scriptText.includes("carousel_media")) {
-        const jsonData = JSON.parse(scriptText);
-        extractCarouselMediaOnly(jsonData, addMediaUrl);
-        extractThreadUnrollChain(jsonData, authorUsername, replyChain);
-      }
-    } catch {
-    }
-  }
-  if (mediaUrls.length === 0 && ogImage) {
-    addMediaUrl(ogImage);
-  }
-  if (content && content.startsWith(authorName)) {
-    content = content.substring(authorName.length).trim();
-  }
-  return {
-    id: fallbackId,
-    url: targetUrl,
-    authorName: authorName.replace(/^@/, ""),
-    authorUsername: authorUsername || "user",
-    content: content || "No text content found in post.",
-    mediaUrls,
-    replyChain: replyChain.length > 0 ? replyChain : void 0,
-    timestamp: (/* @__PURE__ */ new Date()).toISOString()
-  };
-}
-function extractCarouselMediaOnly(obj, addMediaFn) {
-  if (!obj || typeof obj !== "object")
-    return;
-  const ignoredKeys = /* @__PURE__ */ new Set([
-    "suggested_users",
-    "user_recommendations",
-    "recs_feed",
-    "profile_pic",
-    "user",
-    "author",
-    "related_posts",
-    "header"
-  ]);
-  if (obj.carousel_media && Array.isArray(obj.carousel_media)) {
-    for (const item of obj.carousel_media) {
-      if (item.image_versions2 && item.image_versions2.candidates && item.image_versions2.candidates.length > 0) {
-        const bestImage = item.image_versions2.candidates[0].url;
-        if (bestImage) {
-          addMediaFn(bestImage);
-        }
-      }
-    }
-    return;
-  }
-  if (obj.image_versions2 && obj.image_versions2.candidates) {
-    const candidates = obj.image_versions2.candidates;
-    if (Array.isArray(candidates) && candidates.length > 0) {
-      const bestImage = candidates[0].url;
-      if (bestImage) {
-        addMediaFn(bestImage);
-      }
-    }
-  }
-  for (const key of Object.keys(obj)) {
-    if (ignoredKeys.has(key))
-      continue;
-    if (typeof obj[key] === "object") {
-      extractCarouselMediaOnly(obj[key], addMediaFn);
-    }
-  }
-}
-function extractThreadUnrollChain(obj, mainAuthorUsername, replyChain) {
-  if (!obj || typeof obj !== "object")
-    return;
-  if (obj.thread_items && Array.isArray(obj.thread_items) && obj.thread_items.length > 1) {
-    for (let i = 1; i < obj.thread_items.length; i++) {
-      const item = obj.thread_items[i];
-      if (!item || !item.post)
-        continue;
-      const postUser = item.post.user?.username || "";
-      if (mainAuthorUsername && postUser && postUser.toLowerCase() !== mainAuthorUsername.toLowerCase()) {
-        continue;
-      }
-      const replyText = item.post.caption?.text || "";
-      const replyMedia = [];
-      if (item.post.carousel_media && Array.isArray(item.post.carousel_media)) {
-        for (const c of item.post.carousel_media) {
-          if (c.image_versions2?.candidates?.length > 0) {
-            replyMedia.push(c.image_versions2.candidates[0].url);
-          }
-        }
-      } else if (item.post.image_versions2?.candidates?.length > 0) {
-        replyMedia.push(item.post.image_versions2.candidates[0].url);
-      }
-      if (replyText || replyMedia.length > 0) {
-        replyChain.push({
-          authorUsername: postUser || mainAuthorUsername,
-          authorName: item.post.user?.full_name || postUser || mainAuthorUsername,
-          content: replyText,
-          mediaUrls: replyMedia.filter(isMainPostImage)
-        });
-      }
-    }
-  }
-  for (const key of Object.keys(obj)) {
-    if (typeof obj[key] === "object" && key !== "suggested_users" && key !== "recs_feed") {
-      extractThreadUnrollChain(obj[key], mainAuthorUsername, replyChain);
-    }
-  }
-}
-
-// src/downloader.ts
-var import_obsidian3 = require("obsidian");
-async function ensureFolderExists(app, folderPath) {
-  const normalized = (0, import_obsidian3.normalizePath)(folderPath);
-  if (normalized === "" || normalized === ".")
-    return;
-  const folder = app.vault.getAbstractFileByPath(normalized);
-  if (!folder) {
-    await app.vault.createFolder(normalized);
-  }
-}
-async function downloadMediaLocally(app, post, attachmentsFolder) {
-  const mainMediaEmbeds = [];
-  const replyMediaEmbeds = [];
-  await ensureFolderExists(app, attachmentsFolder);
-  for (let i = 0; i < post.mediaUrls.length; i++) {
-    const mediaUrl = post.mediaUrls[i];
-    try {
-      const extensionMatch = mediaUrl.match(/\.(jpg|jpeg|png|webp)/i);
-      const ext = extensionMatch ? extensionMatch[1] : "jpg";
-      const fileName = `threads_${post.id}_${i + 1}.${ext}`;
-      const filePath = (0, import_obsidian3.normalizePath)(`${attachmentsFolder}/${fileName}`);
-      const existingFile = app.vault.getAbstractFileByPath(filePath);
-      if (existingFile instanceof import_obsidian3.TFile) {
-        mainMediaEmbeds.push(`![[${filePath}]]`);
-        continue;
-      }
-      const response = await (0, import_obsidian3.requestUrl)({ url: mediaUrl, method: "GET" });
-      if (response.status === 200 && response.arrayBuffer) {
-        await app.vault.createBinary(filePath, response.arrayBuffer);
-        mainMediaEmbeds.push(`![[${filePath}]]`);
-      } else {
-        mainMediaEmbeds.push(`![Media ${i + 1}](${mediaUrl})`);
-      }
-    } catch {
-      mainMediaEmbeds.push(`![Media ${i + 1}](${mediaUrl})`);
-    }
-  }
-  if (post.replyChain && post.replyChain.length > 0) {
-    for (let rIdx = 0; rIdx < post.replyChain.length; rIdx++) {
-      const reply = post.replyChain[rIdx];
-      for (let mIdx = 0; mIdx < reply.mediaUrls.length; mIdx++) {
-        const mUrl = reply.mediaUrls[mIdx];
-        try {
-          const fileName = `threads_${post.id}_reply${rIdx + 1}_${mIdx + 1}.jpg`;
-          const filePath = (0, import_obsidian3.normalizePath)(`${attachmentsFolder}/${fileName}`);
-          const existingFile = app.vault.getAbstractFileByPath(filePath);
-          if (existingFile instanceof import_obsidian3.TFile) {
-            replyMediaEmbeds.push(`![[${filePath}]]`);
-            continue;
-          }
-          const resp = await (0, import_obsidian3.requestUrl)({ url: mUrl, method: "GET" });
-          if (resp.status === 200 && resp.arrayBuffer) {
-            await app.vault.createBinary(filePath, resp.arrayBuffer);
-            replyMediaEmbeds.push(`![[${filePath}]]`);
-          } else {
-            replyMediaEmbeds.push(`![Reply Media ${mIdx + 1}](${mUrl})`);
-          }
-        } catch {
-          replyMediaEmbeds.push(`![Reply Media ${mIdx + 1}](${mUrl})`);
-        }
-      }
-    }
-  }
-  return { mainMediaEmbeds, replyMediaEmbeds };
-}
-function formatReplyChainMarkdown(post) {
-  const replyChain = post.replyChain;
-  if (!replyChain || replyChain.length === 0)
-    return "";
-  const totalCount = 1 + replyChain.length;
-  const lines = ["\n### \u{1F9F5} Thread Chain (Unrolled)"];
-  lines.push(`
-#### 1/${totalCount} @${post.authorUsername}`);
-  if (post.content) {
-    lines.push(`> ${post.content.replace(/\n/g, "\n> ")}`);
-  }
-  for (let i = 0; i < replyChain.length; i++) {
-    const item = replyChain[i];
-    lines.push(`
-#### ${i + 2}/${totalCount} @${item.authorUsername}`);
-    if (item.content) {
-      lines.push(`> ${item.content.replace(/\n/g, "\n> ")}`);
-    }
-  }
-  return lines.join("\n\n");
-}
-function renderVisualPostCard(post, formattedDate, unrollChain) {
-  const totalCount = unrollChain && post.replyChain ? 1 + post.replyChain.length : 1;
-  const counterBadge = totalCount > 1 ? ` \u2022 1/${totalCount}` : "";
-  let cardsHtml = `<div class="threads-thread-container">
-  <div class="threads-card">
-    <div class="threads-card-header">
-      <div class="threads-card-user">
-        <span class="threads-card-name">${post.authorName}</span>
-        <span class="threads-card-username">@${post.authorUsername}${counterBadge}</span>
-      </div>
-      <span class="threads-card-badge">Threads</span>
-    </div>
-    <div class="threads-card-body">${post.content}</div>
-    <div class="threads-card-footer">
-      <span>${formattedDate}</span>
-      <a class="threads-card-link" href="${post.url}" target="_blank">Original Post \u2197</a>
-    </div>
-  </div>`;
-  if (unrollChain && post.replyChain && post.replyChain.length > 0) {
-    for (let i = 0; i < post.replyChain.length; i++) {
-      const reply = post.replyChain[i];
-      cardsHtml += `
-  <div class="threads-thread-line"></div>
-  <div class="threads-card threads-card-reply">
-    <div class="threads-card-header">
-      <div class="threads-card-user">
-        <span class="threads-card-name">${reply.authorName || reply.authorUsername}</span>
-        <span class="threads-card-username">@${reply.authorUsername} \u2022 ${i + 2}/${totalCount}</span>
-      </div>
-    </div>
-    <div class="threads-card-body">${reply.content}</div>
-  </div>`;
-    }
-  }
-  cardsHtml += `
-</div>`;
-  return cardsHtml;
-}
-async function generateThreadsNoteContent(app, post, settings) {
-  let allMediaEmbeds = [];
-  if (settings.includeMedia) {
-    if (settings.downloadMediaLocally) {
-      const downloaded = await downloadMediaLocally(app, post, settings.attachmentsFolder);
-      allMediaEmbeds = [...downloaded.mainMediaEmbeds, ...downloaded.replyMediaEmbeds];
-    } else {
-      allMediaEmbeds = post.mediaUrls.map((url, idx) => `![Image ${idx + 1}](${url})`);
-      if (post.replyChain) {
-        for (const r of post.replyChain) {
-          for (const u of r.mediaUrls) {
-            allMediaEmbeds.push(`![Reply Image](${u})`);
-          }
-        }
-      }
-    }
-  }
-  const tagsFormatted = settings.tags.map((t) => t.trim().replace(/^#/, "")).concat([`threads/${post.authorUsername}`]).map((t) => `  - ${t}`).join("\n");
-  const formattedDate = post.timestamp ? new Date(post.timestamp).toISOString().split("T")[0] : (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
-  const savedAt = (/* @__PURE__ */ new Date()).toLocaleString();
-  const hasReplyChain = settings.unrollThreadChain && post.replyChain && post.replyChain.length > 0;
-  const mediaSection = settings.includeMedia && allMediaEmbeds.length > 0 ? "### Media\n" + allMediaEmbeds.join("\n\n") : "";
-  const replyChainSection = settings.unrollThreadChain ? formatReplyChainMarkdown(post) : "";
-  const visualCardHtml = settings.useVisualCard ? renderVisualPostCard(post, formattedDate, settings.unrollThreadChain) : "";
-  const contentBlock = settings.useVisualCard || hasReplyChain ? "" : `> ${post.content.replace(/\n/g, "\n> ")}`;
-  const bodyTemplate = settings.noteBodyTemplate || "";
-  const noteContent = bodyTemplate.replace(/\{\{visual_card\}\}/g, visualCardHtml).replace(/\{\{author_name\}\}/g, post.authorName).replace(/\{\{author_username\}\}/g, post.authorUsername).replace(/\{\{url\}\}/g, post.url).replace(/\{\{date\}\}/g, formattedDate).replace(/\{\{saved_at\}\}/g, savedAt).replace(/\{\{content\}\}/g, contentBlock).replace(/\{\{media\}\}/g, mediaSection).replace(/\{\{reply_chain\}\}/g, replyChainSection).replace(/\{\{tags\}\}/g, tagsFormatted);
-  const cleanedContent = noteContent.replace(/\n\n\n+/g, "\n\n");
-  const cleanTitle = settings.noteTitleTemplate.replace("{{author_username}}", post.authorUsername).replace("{{author_name}}", post.authorName).replace("{{id}}", post.id).replace(/[^a-zA-Z0-9 _-]/g, "");
-  return {
-    title: cleanTitle,
-    content: cleanedContent
-  };
-}
-async function saveThreadsPostToVault(app, post, settings, options = {}) {
-  const { showNotice = true } = options;
-  await ensureFolderExists(app, settings.notesFolder);
-  const { title, content } = await generateThreadsNoteContent(app, post, settings);
-  const filePath = (0, import_obsidian3.normalizePath)(`${settings.notesFolder}/${title}.md`);
-  const existingFile = app.vault.getAbstractFileByPath(filePath);
-  if (existingFile instanceof import_obsidian3.TFile) {
-    await app.vault.modify(existingFile, content);
-    if (showNotice) {
-      new import_obsidian3.Notice(`Updated Threads note: ${title}`);
-    }
-    return existingFile;
-  } else {
-    const newFile = await app.vault.create(filePath, content);
-    if (showNotice) {
-      new import_obsidian3.Notice(`Saved Threads note: ${title}`);
-    }
-    return newFile;
-  }
-}
-
 // src/main.ts
-function extractAllThreadsUrls(text) {
-  const matches = text.match(
-    /https?:\/\/(www\.)?threads\.(net|com)\/(@[a-zA-Z0-9_.-]+\/post\/[a-zA-Z0-9_.-]+|t\/[a-zA-Z0-9_.-]+|share\/[a-zA-Z0-9_.-]+)(?:[/?#][^\s<>"'`)\]}]*)?/gi
-  );
-  return matches ? Array.from(
-    new Set(matches.map((match) => match.replace(/[.,;:!?]+$/g, "")))
-  ) : [];
-}
+var SESSION_SECRET_ID = "social-saver-sessionid";
 function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function inlinePostMarkdown(platform, authorUsername, content, url) {
+  const label = platform === "threads" ? "Threads" : "Instagram";
+  const quoted = content.split(/\r?\n/).map((line) => `> ${escapeMarkdownText(line)}`).join("\n");
+  return `> **@${escapeMarkdownText(authorUsername)}** \xB7 ${label}
+${quoted}
+> [Original post](${escapeMarkdownUrl(url)})
+`;
+}
+var SocialSaverPlugin = class extends import_obsidian4.Plugin {
   constructor() {
     super(...arguments);
-    this.settings = DEFAULT_SETTINGS;
+    this.settings = { ...DEFAULT_SETTINGS };
     this.focusListener = null;
     this.lastProcessedClipboardUrl = "";
   }
   async onload() {
-    console.log("Loading Threads Saver Plugin");
     await this.loadSettings();
-    this.addRibbonIcon("at-sign", "Save Threads Post from Clipboard", () => {
-      this.handleSaveFromClipboard();
+    this.addRibbonIcon("archive", "Save social post from clipboard", () => {
+      void this.handleSaveFromClipboard();
+    });
+    this.addCommand({
+      id: "social-save-from-clipboard",
+      name: "Save Threads or Instagram post from clipboard",
+      callback: () => this.handleSaveFromClipboard()
+    });
+    this.addCommand({
+      id: "social-insert-at-cursor",
+      name: "Insert Threads or Instagram post at cursor",
+      editorCallback: (editor) => this.handleInsertAtCursor(editor)
+    });
+    this.addCommand({
+      id: "social-convert-links-in-active-note",
+      name: "Process all Threads and Instagram links in active note",
+      callback: () => this.handleConvertActiveNoteLinks()
     });
     this.addCommand({
       id: "threads-save-from-clipboard",
-      name: "Save Threads Post from Clipboard",
+      name: "Save social post from clipboard (legacy command)",
       callback: () => this.handleSaveFromClipboard()
     });
     this.addCommand({
       id: "threads-insert-at-cursor",
-      name: "Insert Threads Post at Cursor",
+      name: "Insert social post at cursor (legacy command)",
       editorCallback: (editor) => this.handleInsertAtCursor(editor)
     });
     this.addCommand({
       id: "threads-convert-links-in-active-note",
-      name: "Process All Threads Links in Active Note",
+      name: "Process social links in active note (legacy command)",
       callback: () => this.handleConvertActiveNoteLinks()
     });
     this.registerEvent(
       this.app.workspace.on("editor-menu", (menu, editor) => {
-        const selectedText = editor.getSelection().trim();
-        const cursorLine = editor.getLine(editor.getCursor().line).trim();
-        const targetText = selectedText || cursorLine;
-        const urls = extractAllThreadsUrls(targetText);
-        if (urls.length > 0) {
-          menu.addItem((item) => {
-            item.setTitle("Convert Threads Link").setIcon("at-sign").onClick(async () => {
-              await this.processAndReplaceLinkInEditor(editor, urls[0]);
-            });
-          });
-        }
+        const selection = editor.getSelection();
+        const lineNumber = editor.getCursor().line;
+        const source = selection || editor.getLine(lineNumber);
+        const match = extractSocialUrlMatches(source)[0];
+        if (!match) return;
+        menu.addItem((item) => {
+          item.setTitle("Convert social post link").setIcon("archive").onClick(
+            () => this.processAndReplaceLinkInEditor(
+              editor,
+              match.raw,
+              match.canonicalUrl,
+              Boolean(selection),
+              lineNumber
+            )
+          );
+        });
       })
     );
-    this.registerObsidianProtocolHandler("threads-saver", async (params) => {
-      if (params.url) {
-        new import_obsidian4.Notice("Processing Threads URL from deep link...");
-        await this.processAndSaveUrl(params.url);
-      }
-    });
-    this.focusListener = async () => {
-      if (!this.settings.clipboardAutoDetect)
+    const protocolHandler = async (params) => {
+      const parsed = params.url ? parseSupportedSocialUrl(params.url) : null;
+      if (!parsed) {
+        new import_obsidian4.Notice("Deep link contains an unsupported or unsafe URL.");
         return;
-      try {
-        if (navigator.clipboard && navigator.clipboard.readText) {
-          const text = await navigator.clipboard.readText();
-          const urls = extractAllThreadsUrls(text);
-          const url = urls[0];
-          if (url && url !== this.lastProcessedClipboardUrl) {
-            this.showClipboardNotice(url);
-          }
-        }
-      } catch {
       }
+      await this.processAndSaveUrl(parsed.canonicalUrl);
+    };
+    this.registerObsidianProtocolHandler("social-saver", protocolHandler);
+    this.registerObsidianProtocolHandler("threads-saver", protocolHandler);
+    this.focusListener = () => {
+      if (!this.settings.clipboardAutoDetect) return;
+      void this.checkClipboardOnFocus();
     };
     window.addEventListener("focus", this.focusListener);
     this.addSettingTab(new ThreadsSaverSettingTab(this.app, this));
   }
   onunload() {
-    console.log("Unloading Threads Saver Plugin");
     if (this.focusListener) {
       window.removeEventListener("focus", this.focusListener);
       this.focusListener = null;
     }
   }
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const stored = await this.loadData() ?? {};
+    const merged = { ...DEFAULT_SETTINGS };
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+      const value = stored[key];
+      if (value !== void 0) {
+        merged[key] = value;
+      }
+    }
+    if (stored.notesFolder && !stored.threadsFolder) {
+      merged.threadsFolder = stored.notesFolder;
+    }
+    this.settings = merged;
+    if (stored.sessionCookie && !this.getSessionCookie()) {
+      this.setSessionCookie(stored.sessionCookie);
+    }
+    if (stored.sessionCookie || stored.notesFolder) {
+      await this.saveSettings();
+    }
   }
   async saveSettings() {
     await this.saveData(this.settings);
   }
-  /**
-   * Reads clipboard and saves Threads post.
-   */
+  getSessionCookie() {
+    return this.app.secretStorage.getSecret(SESSION_SECRET_ID) ?? "";
+  }
+  setSessionCookie(value) {
+    this.app.secretStorage.setSecret(SESSION_SECRET_ID, value.trim());
+  }
+  async checkClipboardOnFocus() {
+    try {
+      const text = await navigator.clipboard.readText();
+      const url = extractAllSocialUrls(text)[0];
+      if (url && url !== this.lastProcessedClipboardUrl) {
+        this.showClipboardNotice(url);
+      }
+    } catch {
+    }
+  }
   async handleSaveFromClipboard() {
     try {
       const text = await navigator.clipboard.readText();
-      const trimmed = text.trim();
-      const urls = extractAllThreadsUrls(trimmed);
-      if (urls.length === 0) {
-        new import_obsidian4.Notice("Clipboard does not contain a valid Threads URL.");
+      const url = extractAllSocialUrls(text)[0];
+      if (!url) {
+        new import_obsidian4.Notice(
+          "Clipboard does not contain a supported Threads or Instagram URL."
+        );
         return;
       }
-      await this.processAndSaveUrl(urls[0]);
+      await this.processAndSaveUrl(url);
     } catch {
-      new import_obsidian4.Notice("Could not read clipboard. Please check app permissions.");
+      new import_obsidian4.Notice("Could not read the clipboard. Check Obsidian permissions.");
     }
   }
-  /**
-   * Converts all raw Threads URLs in active note.
-   */
   async handleConvertActiveNoteLinks() {
     const activeFile = this.app.workspace.getActiveFile();
     if (!activeFile) {
-      new import_obsidian4.Notice("No active note open.");
+      new import_obsidian4.Notice("No active note is open.");
       return;
     }
-    const content = await this.app.vault.read(activeFile);
-    const urls = extractAllThreadsUrls(content);
+    const initialContent = await this.app.vault.read(activeFile);
+    const matches = extractSocialUrlMatches(initialContent);
+    const urls = [...new Set(matches.map((match) => match.canonicalUrl))];
     if (urls.length === 0) {
-      new import_obsidian4.Notice("No raw Threads URLs found in active note.");
+      new import_obsidian4.Notice("No supported Threads or Instagram URLs found.");
       return;
     }
-    const progressNotice = new import_obsidian4.Notice(
-      `Processing Threads links: 0/${urls.length}`,
-      0
-    );
-    const processedFiles = /* @__PURE__ */ new Map();
-    const failedUrls = [];
+    const progress = new import_obsidian4.Notice(`Processing social links: 0/${urls.length}`, 0);
+    const saved = /* @__PURE__ */ new Map();
+    const failed = [];
     try {
-      for (let index = 0; index < urls.length; index++) {
-        const url = urls[index];
-        progressNotice.setMessage(
-          `Processing Threads links: ${index + 1}/${urls.length}`
+      for (let index = 0; index < urls.length; index += 1) {
+        progress.setMessage(
+          `Processing social links: ${index + 1}/${urls.length}`
         );
-        const savedFile = await this.processAndSaveUrl(url, {
+        const result = await this.processAndSaveUrl(urls[index], {
           openFile: false,
           showNotices: false
         });
-        if (savedFile) {
-          processedFiles.set(url, savedFile);
-        } else {
-          failedUrls.push(url);
-        }
+        if (result) saved.set(urls[index], result);
+        else failed.push(urls[index]);
       }
-      if (processedFiles.size > 0) {
-        await this.app.vault.process(activeFile, (latestContent) => {
-          let updatedContent = latestContent;
-          for (const [url, savedFile] of processedFiles) {
+      if (saved.size > 0) {
+        await this.app.vault.process(activeFile, (latest) => {
+          let updated = latest;
+          for (const match of extractSocialUrlMatches(latest)) {
+            const result = saved.get(match.canonicalUrl);
+            if (!result) continue;
             const noteLink = this.app.fileManager.generateMarkdownLink(
-              savedFile,
-              activeFile.path
+              result.file,
+              activeFile.path,
+              result.subpath
             );
-            const markdownLinkPattern = new RegExp(
-              `\\[([^\\]\\n]+)\\]\\(${escapeRegExp(url)}\\)`,
+            const markdownLink = new RegExp(
+              `\\[([^\\]\\n]+)\\]\\(${escapeRegExp(match.raw)}\\)`,
               "g"
             );
-            updatedContent = updatedContent.replace(
-              markdownLinkPattern,
-              (_match, alias) => this.app.fileManager.generateMarkdownLink(
-                savedFile,
+            updated = updated.replace(
+              markdownLink,
+              (_full, alias) => this.app.fileManager.generateMarkdownLink(
+                result.file,
                 activeFile.path,
-                void 0,
+                result.subpath,
                 alias
               )
             );
-            updatedContent = updatedContent.split(`<${url}>`).join(noteLink);
-            updatedContent = updatedContent.split(url).join(noteLink);
+            updated = updated.split(`<${match.raw}>`).join(noteLink);
+            updated = updated.split(match.raw).join(noteLink);
           }
-          return updatedContent;
+          return updated;
         });
       }
-    } catch (err) {
-      console.error("Bulk Threads processing stopped:", err);
-      new import_obsidian4.Notice(
-        "Bulk processing stopped before the active note could be fully updated.",
-        8e3
-      );
-      return;
     } finally {
-      progressNotice.hide();
+      progress.hide();
     }
-    const processedCount = processedFiles.size;
-    const failedCount = failedUrls.length;
-    const summary = failedCount === 0 ? `Processed ${processedCount} Threads link(s).` : `Processed ${processedCount} Threads link(s); ${failedCount} failed and remained unchanged.`;
-    new import_obsidian4.Notice(summary, 8e3);
-    if (failedCount > 0) {
-      console.error("Failed bulk Threads URLs:", failedUrls);
-    }
+    new import_obsidian4.Notice(
+      failed.length === 0 ? `Processed ${saved.size} social link(s).` : `Processed ${saved.size}; ${failed.length} failed and remained unchanged.`,
+      8e3
+    );
   }
-  /**
-   * Fetches Threads post and inserts Markdown at active editor cursor.
-   */
   async handleInsertAtCursor(editor) {
     try {
       const text = await navigator.clipboard.readText();
-      const trimmed = text.trim();
-      const urls = extractAllThreadsUrls(trimmed);
-      if (urls.length === 0) {
-        new import_obsidian4.Notice("Clipboard does not contain a valid Threads URL.");
+      const url = extractAllSocialUrls(text)[0];
+      if (!url) {
+        new import_obsidian4.Notice(
+          "Clipboard does not contain a supported Threads or Instagram URL."
+        );
         return;
       }
-      new import_obsidian4.Notice("Fetching Threads post content...");
-      const post = await parseThreadsPost(urls[0], this.settings.sessionCookie, this.settings.customUserAgent);
-      const markdown = `> **@${post.authorUsername}**: ${post.content}
-> [Original Post](${post.url})
-`;
-      editor.replaceSelection(markdown);
-      new import_obsidian4.Notice("Inserted Threads post into note!");
-    } catch (err) {
-      new import_obsidian4.Notice(`Error inserting Threads post: ${err.message}`);
+      const post = await parseSocialPost(
+        url,
+        this.getSessionCookie(),
+        this.settings.customUserAgent
+      );
+      editor.replaceSelection(
+        inlinePostMarkdown(
+          post.platform,
+          post.authorUsername,
+          post.content,
+          post.url
+        )
+      );
+      new import_obsidian4.Notice("Social post inserted.");
+    } catch (error) {
+      new import_obsidian4.Notice(`Could not insert post: ${errorMessage(error)}`);
     }
   }
-  /**
-   * Processes a Threads URL and replaces it in current editor.
-   */
-  async processAndReplaceLinkInEditor(editor, url) {
-    new import_obsidian4.Notice("Fetching Threads post details...");
+  async processAndReplaceLinkInEditor(editor, rawUrl, canonicalUrl, hasSelection, lineNumber) {
     try {
-      const post = await parseThreadsPost(url, this.settings.sessionCookie, this.settings.customUserAgent);
-      const { content } = await generateThreadsNoteContent(this.app, post, this.settings);
-      editor.replaceSelection(content);
-      new import_obsidian4.Notice("Converted Threads link into enriched content!");
-    } catch (err) {
-      new import_obsidian4.Notice(`Failed to convert link: ${err.message}`);
+      const post = await parseSocialPost(
+        canonicalUrl,
+        this.getSessionCookie(),
+        this.settings.customUserAgent
+      );
+      const markdown = inlinePostMarkdown(
+        post.platform,
+        post.authorUsername,
+        post.content,
+        post.url
+      );
+      if (hasSelection) {
+        editor.replaceSelection(markdown);
+      } else {
+        const line = editor.getLine(lineNumber);
+        const start = line.indexOf(rawUrl);
+        if (start < 0) throw new Error("The link moved before it was replaced.");
+        editor.replaceRange(
+          markdown.trimEnd(),
+          { line: lineNumber, ch: start },
+          { line: lineNumber, ch: start + rawUrl.length }
+        );
+      }
+      new import_obsidian4.Notice("Social post link converted.");
+    } catch (error) {
+      new import_obsidian4.Notice(`Could not convert link: ${errorMessage(error)}`);
     }
   }
-  /**
-   * Fetches Threads post and saves to vault as a NEW note.
-   */
   async processAndSaveUrl(url, options = {}) {
     const { openFile = true, showNotices = true } = options;
+    const parsed = parseSupportedSocialUrl(url);
+    if (!parsed) {
+      if (showNotices) new import_obsidian4.Notice("Unsupported or unsafe social URL.");
+      return null;
+    }
     if (showNotices) {
-      new import_obsidian4.Notice("Fetching Threads post details...");
+      new import_obsidian4.Notice(
+        `Fetching ${parsed.platform === "threads" ? "Threads" : "Instagram"} post\u2026`
+      );
     }
     try {
-      const post = await parseThreadsPost(url, this.settings.sessionCookie, this.settings.customUserAgent);
-      const savedFile = await saveThreadsPostToVault(
+      const post = await parseSocialPost(
+        parsed.canonicalUrl,
+        this.getSessionCookie(),
+        this.settings.customUserAgent
+      );
+      const result = await saveSocialPostToVault(
         this.app,
         post,
-        this.settings,
-        { showNotice: showNotices }
+        this.settings
       );
-      this.lastProcessedClipboardUrl = url;
+      this.lastProcessedClipboardUrl = parsed.canonicalUrl;
       if (openFile) {
-        const leaf = this.app.workspace.getLeaf(false);
-        await leaf.openFile(savedFile);
+        await this.app.workspace.getLeaf(false).openFile(result.file);
       }
-      return savedFile;
-    } catch (err) {
-      console.error("Error processing Threads URL:", err);
       if (showNotices) {
-        new import_obsidian4.Notice(`Failed to save Threads post: ${err.message || err}`);
+        new import_obsidian4.Notice(
+          `Saved ${post.platform === "threads" ? "Threads" : "Instagram"} post.`
+        );
+      }
+      return result;
+    } catch (error) {
+      console.error("Social Saver could not process the URL:", error);
+      if (showNotices) {
+        new import_obsidian4.Notice(`Could not save post: ${errorMessage(error)}`, 8e3);
       }
       return null;
     }
   }
-  /**
-   * Shows an interactive toast notice when a Threads link is detected in clipboard on app focus.
-   */
   showClipboardNotice(url) {
-    const noticeEl = new import_obsidian4.Notice("", 8e3);
-    const container = noticeEl.noticeEl.createDiv({ cls: "threads-notice-container" });
-    const titleEl = container.createDiv({ cls: "threads-notice-title" });
-    titleEl.setText("\u{1F4CC} Threads link detected in clipboard!");
-    const actionsEl = container.createDiv({ cls: "threads-notice-actions" });
-    const saveBtn = actionsEl.createEl("button", {
-      text: "Save to Vault",
+    const parsed = parseSupportedSocialUrl(url);
+    if (!parsed) return;
+    const platform = parsed.platform === "threads" ? "Threads" : "Instagram";
+    const notice = new import_obsidian4.Notice("", 8e3);
+    const container = notice.noticeEl.createDiv({
+      cls: "threads-notice-container"
+    });
+    container.createDiv({ cls: "threads-notice-title" }).setText(`${platform} link detected in clipboard`);
+    const actions = container.createDiv({ cls: "threads-notice-actions" });
+    const save = actions.createEl("button", {
+      text: "Save to vault",
       cls: "threads-btn-primary"
     });
-    const ignoreBtn = actionsEl.createEl("button", {
+    const ignore = actions.createEl("button", {
       text: "Ignore",
       cls: "threads-btn-secondary"
     });
-    saveBtn.addEventListener("click", async () => {
-      noticeEl.hide();
-      await this.processAndSaveUrl(url);
+    save.addEventListener("click", () => {
+      notice.hide();
+      void this.processAndSaveUrl(parsed.canonicalUrl);
     });
-    ignoreBtn.addEventListener("click", () => {
-      this.lastProcessedClipboardUrl = url;
-      noticeEl.hide();
+    ignore.addEventListener("click", () => {
+      this.lastProcessedClipboardUrl = parsed.canonicalUrl;
+      notice.hide();
     });
   }
 };
