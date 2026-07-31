@@ -751,7 +751,7 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
     }
   }
   /**
-   * Checks if a file contains a raw Threads URL (e.g. from Mobile Share Sheet) and auto-enriches it.
+   * Checks if a file contains a raw Threads URL line (e.g. from Mobile Share Sheet) and auto-enriches it.
    */
   async checkAndEnrichShareSheetFile(file) {
     if (this.processingFiles.has(file.path))
@@ -759,11 +759,23 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
     try {
       const content = await this.app.vault.read(file);
       const urls = extractAllThreadsUrls(content);
-      if (urls.length === 1 && content.trim() === urls[0]) {
+      if (urls.length === 0)
+        return;
+      const lines = content.split("\n");
+      const hasStandaloneLink = lines.some((l) => {
+        const trimmed = l.trim().replace(/^\[|\]\(https?:\/\/[^)]+\)$/g, "");
+        return urls.includes(trimmed) || isThreadsUrl(trimmed);
+      });
+      if (hasStandaloneLink || content.trim() === urls[0]) {
         this.processingFiles.add(file.path);
         new import_obsidian4.Notice("Enriching shared Threads post link...");
         const post = await parseThreadsPost(urls[0], this.settings.sessionCookie, this.settings.customUserAgent);
-        await saveThreadsPostToVault(this.app, post, this.settings);
+        if (content.trim() === urls[0] || lines.length <= 2) {
+          const { content: enrichedContent } = await generateThreadsNoteContent(this.app, post, this.settings);
+          await this.app.vault.modify(file, enrichedContent);
+        } else {
+          await saveThreadsPostToVault(this.app, post, this.settings);
+        }
         this.processingFiles.delete(file.path);
       }
     } catch {
