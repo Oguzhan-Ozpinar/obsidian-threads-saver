@@ -1,0 +1,32 @@
+{
+  "name": "obsidian-threads-saver",
+  "version": "1.0.0",
+  "description": "Save Instagram Threads posts into formatted Markdown notes inside Obsidian, optimized for mobile and desktop.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "threads",
+    "instagram-threads",
+    "saver",
+    "mobile"
+  ],
+  "author": "Oguzhan-Ozpinar",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Oguzhan-Ozpinar/obsidian-threads-saver.git"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "0.19.11",
+    "obsidian": "latest",
+    "tslib": "2.6.2",
+    "typescript": "5.3.3"
+  }
+}
