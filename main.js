@@ -550,12 +550,17 @@ async function saveThreadsPostToVault(app, post, settings) {
 }
 
 // src/main.ts
+function extractAllThreadsUrls(text) {
+  const matches = text.match(/https?:\/\/(www\.)?threads\.(net|com)\/(@[a-zA-Z0-9_.-]+\/post\/[a-zA-Z0-9_.-]+|t\/[a-zA-Z0-9_.-]+|share\/[a-zA-Z0-9_.-]+)/gi);
+  return matches ? Array.from(new Set(matches.map((m) => m.trim()))) : [];
+}
 var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
   constructor() {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
     this.focusListener = null;
     this.lastProcessedClipboardUrl = "";
+    this.processingFiles = /* @__PURE__ */ new Set();
   }
   async onload() {
     console.log("Loading Threads Saver Plugin");
@@ -573,6 +578,26 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
       name: "Insert Threads Post at Cursor",
       editorCallback: (editor) => this.handleInsertAtCursor(editor)
     });
+    this.addCommand({
+      id: "threads-convert-links-in-active-note",
+      name: "Convert Threads Links in Active Note",
+      callback: () => this.handleConvertActiveNoteLinks()
+    });
+    this.registerEvent(
+      this.app.workspace.on("editor-menu", (menu, editor) => {
+        const selectedText = editor.getSelection().trim();
+        const cursorLine = editor.getLine(editor.getCursor().line).trim();
+        const targetText = selectedText || cursorLine;
+        const urls = extractAllThreadsUrls(targetText);
+        if (urls.length > 0) {
+          menu.addItem((item) => {
+            item.setTitle("Convert Threads Link").setIcon("at-sign").onClick(async () => {
+              await this.processAndReplaceLinkInEditor(editor, urls[0]);
+            });
+          });
+        }
+      })
+    );
     this.registerObsidianProtocolHandler("threads-saver", async (params) => {
       if (params.url) {
         new import_obsidian4.Notice("Processing Threads URL from share...");
@@ -586,7 +611,20 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
         if (file instanceof import_obsidian4.TFile && file.extension === "md") {
           setTimeout(async () => {
             await this.checkAndEnrichShareSheetFile(file);
-          }, 300);
+          }, 400);
+        }
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("modify", async (file) => {
+        if (!this.settings.autoEnrichShareSheetLinks)
+          return;
+        if (file instanceof import_obsidian4.TFile && file.extension === "md") {
+          if (this.processingFiles.has(file.path))
+            return;
+          setTimeout(async () => {
+            await this.checkAndEnrichShareSheetFile(file);
+          }, 600);
         }
       })
     );
@@ -627,13 +665,34 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
     try {
       const text = await navigator.clipboard.readText();
       const trimmed = text.trim();
-      if (!isThreadsUrl(trimmed)) {
+      const urls = extractAllThreadsUrls(trimmed);
+      if (urls.length === 0) {
         new import_obsidian4.Notice("Clipboard does not contain a valid Threads URL.");
         return;
       }
-      await this.processAndSaveUrl(trimmed);
-    } catch (err) {
+      await this.processAndSaveUrl(urls[0]);
+    } catch {
       new import_obsidian4.Notice("Could not read clipboard. Please check app permissions.");
+    }
+  }
+  /**
+   * Converts all raw Threads URLs in active note.
+   */
+  async handleConvertActiveNoteLinks() {
+    const activeFile = this.app.workspace.getActiveFile();
+    if (!activeFile) {
+      new import_obsidian4.Notice("No active note open.");
+      return;
+    }
+    const content = await this.app.vault.read(activeFile);
+    const urls = extractAllThreadsUrls(content);
+    if (urls.length === 0) {
+      new import_obsidian4.Notice("No raw Threads URLs found in active note.");
+      return;
+    }
+    new import_obsidian4.Notice(`Found ${urls.length} Threads URL(s). Processing...`);
+    for (const url of urls) {
+      await this.processAndSaveUrl(url);
     }
   }
   /**
@@ -643,12 +702,13 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
     try {
       const text = await navigator.clipboard.readText();
       const trimmed = text.trim();
-      if (!isThreadsUrl(trimmed)) {
+      const urls = extractAllThreadsUrls(trimmed);
+      if (urls.length === 0) {
         new import_obsidian4.Notice("Clipboard does not contain a valid Threads URL.");
         return;
       }
       new import_obsidian4.Notice("Fetching Threads post content...");
-      const post = await parseThreadsPost(trimmed, this.settings.sessionCookie, this.settings.customUserAgent);
+      const post = await parseThreadsPost(urls[0], this.settings.sessionCookie, this.settings.customUserAgent);
       const markdown = `> **@${post.authorUsername}**: ${post.content}
 > [Original Post](${post.url})
 `;
@@ -656,6 +716,20 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
       new import_obsidian4.Notice("Inserted Threads post into note!");
     } catch (err) {
       new import_obsidian4.Notice(`Error inserting Threads post: ${err.message}`);
+    }
+  }
+  /**
+   * Processes a Threads URL and replaces it in current editor.
+   */
+  async processAndReplaceLinkInEditor(editor, url) {
+    new import_obsidian4.Notice("Fetching Threads post details...");
+    try {
+      const post = await parseThreadsPost(url, this.settings.sessionCookie, this.settings.customUserAgent);
+      const { content } = await generateThreadsNoteContent(this.app, post, this.settings);
+      editor.replaceSelection(content);
+      new import_obsidian4.Notice("Converted Threads link into enriched content!");
+    } catch (err) {
+      new import_obsidian4.Notice(`Failed to convert link: ${err.message}`);
     }
   }
   /**
@@ -677,18 +751,23 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
     }
   }
   /**
-   * Checks if a newly created note contains only a Threads link (e.g. from Share Sheet) and enriches it.
+   * Checks if a file contains a raw Threads URL (e.g. from Mobile Share Sheet) and auto-enriches it.
    */
   async checkAndEnrichShareSheetFile(file) {
+    if (this.processingFiles.has(file.path))
+      return;
     try {
       const content = await this.app.vault.read(file);
-      const trimmed = content.trim();
-      if (isThreadsUrl(trimmed)) {
+      const urls = extractAllThreadsUrls(content);
+      if (urls.length === 1 && content.trim() === urls[0]) {
+        this.processingFiles.add(file.path);
         new import_obsidian4.Notice("Enriching shared Threads post link...");
-        const post = await parseThreadsPost(trimmed, this.settings.sessionCookie, this.settings.customUserAgent);
+        const post = await parseThreadsPost(urls[0], this.settings.sessionCookie, this.settings.customUserAgent);
         await saveThreadsPostToVault(this.app, post, this.settings);
+        this.processingFiles.delete(file.path);
       }
     } catch {
+      this.processingFiles.delete(file.path);
     }
   }
   /**
