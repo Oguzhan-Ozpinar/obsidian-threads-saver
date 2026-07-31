@@ -25,7 +25,6 @@ export interface PluginSettings {
   downloadMediaLocally: boolean;
   includeMedia: boolean;
   clipboardAutoDetect: boolean;
-  autoEnrichShareSheetLinks: boolean;
   unrollThreadChain: boolean;
   useVisualCard: boolean;
   noteTitleTemplate: string;
@@ -62,7 +61,6 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   downloadMediaLocally: true,
   includeMedia: true,
   clipboardAutoDetect: true,
-  autoEnrichShareSheetLinks: true,
   unrollThreadChain: true,
   useVisualCard: false,
   noteTitleTemplate: "Threads - {{author_username}} - {{id}}",

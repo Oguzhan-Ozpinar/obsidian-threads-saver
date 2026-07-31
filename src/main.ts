@@ -1,22 +1,36 @@
 import { Editor, Notice, Plugin, TFile } from "obsidian";
 import { DEFAULT_SETTINGS, PluginSettings } from "./types";
 import { ThreadsSaverSettingTab } from "./settings";
-import { isThreadsUrl, parseThreadsPost } from "./parser";
+import { parseThreadsPost } from "./parser";
 import { generateThreadsNoteContent, saveThreadsPostToVault } from "./downloader";
+
+interface ProcessAndSaveOptions {
+  openFile?: boolean;
+  showNotices?: boolean;
+}
 
 /**
  * Extracts all Threads URLs from a text string.
  */
 function extractAllThreadsUrls(text: string): string[] {
-  const matches = text.match(/https?:\/\/(www\.)?threads\.(net|com)\/(@[a-zA-Z0-9_.-]+\/post\/[a-zA-Z0-9_.-]+|t\/[a-zA-Z0-9_.-]+|share\/[a-zA-Z0-9_.-]+)/gi);
-  return matches ? Array.from(new Set(matches.map((m) => m.trim()))) : [];
+  const matches = text.match(
+    /https?:\/\/(www\.)?threads\.(net|com)\/(@[a-zA-Z0-9_.-]+\/post\/[a-zA-Z0-9_.-]+|t\/[a-zA-Z0-9_.-]+|share\/[a-zA-Z0-9_.-]+)(?:[/?#][^\s<>"'`)\]}]*)?/gi
+  );
+  return matches
+    ? Array.from(
+        new Set(matches.map((match) => match.replace(/[.,;:!?]+$/g, "")))
+      )
+    : [];
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export default class ThreadsSaverPlugin extends Plugin {
   settings: PluginSettings = DEFAULT_SETTINGS;
   private focusListener: (() => void) | null = null;
   private lastProcessedClipboardUrl = "";
-  private processingFiles = new Set<string>();
 
   async onload() {
     console.log("Loading Threads Saver Plugin");
@@ -41,10 +55,10 @@ export default class ThreadsSaverPlugin extends Plugin {
       editorCallback: (editor: Editor) => this.handleInsertAtCursor(editor),
     });
 
-    // 4. Command Palette: Convert Threads Links in Active Note
+    // 4. Command Palette: Process All Threads Links in Active Note
     this.addCommand({
       id: "threads-convert-links-in-active-note",
-      name: "Convert Threads Links in Active Note",
+      name: "Process All Threads Links in Active Note",
       callback: () => this.handleConvertActiveNoteLinks(),
     });
 
@@ -69,48 +83,25 @@ export default class ThreadsSaverPlugin extends Plugin {
       })
     );
 
-    // 6. Obsidian Protocol Handler for Deep Linking / Mobile Share Intents
+    // 6. Obsidian Protocol Handler for Deep Links / iOS Shortcuts
     // URL format: obsidian://threads-saver?url=https://www.threads.com/...
     this.registerObsidianProtocolHandler("threads-saver", async (params) => {
       if (params.url) {
-        new Notice("Processing Threads URL from share...");
+        new Notice("Processing Threads URL from deep link...");
         await this.processAndSaveUrl(params.url);
       }
     });
 
-    // 7. Auto-Enrichment Listener for Mobile Share Sheet (Create & Modify)
-    this.registerEvent(
-      this.app.vault.on("create", async (file) => {
-        if (!this.settings.autoEnrichShareSheetLinks) return;
-        if (file instanceof TFile && file.extension === "md") {
-          setTimeout(async () => {
-            await this.checkAndEnrichShareSheetFile(file);
-          }, 400);
-        }
-      })
-    );
-
-    this.registerEvent(
-      this.app.vault.on("modify", async (file) => {
-        if (!this.settings.autoEnrichShareSheetLinks) return;
-        if (file instanceof TFile && file.extension === "md") {
-          if (this.processingFiles.has(file.path)) return;
-          setTimeout(async () => {
-            await this.checkAndEnrichShareSheetFile(file);
-          }, 600);
-        }
-      })
-    );
-
-    // 8. Window Focus Listener for Clipboard Auto-Detect
+    // 7. Window Focus Listener for Clipboard Auto-Detect
     this.focusListener = async () => {
       if (!this.settings.clipboardAutoDetect) return;
       try {
         if (navigator.clipboard && navigator.clipboard.readText) {
           const text = await navigator.clipboard.readText();
-          const trimmed = text.trim();
-          if (isThreadsUrl(trimmed) && trimmed !== this.lastProcessedClipboardUrl) {
-            this.showClipboardNotice(trimmed);
+          const urls = extractAllThreadsUrls(text);
+          const url = urls[0];
+          if (url && url !== this.lastProcessedClipboardUrl) {
+            this.showClipboardNotice(url);
           }
         }
       } catch {
@@ -120,7 +111,7 @@ export default class ThreadsSaverPlugin extends Plugin {
 
     window.addEventListener("focus", this.focusListener);
 
-    // 9. Add Settings Tab
+    // 8. Add Settings Tab
     this.addSettingTab(new ThreadsSaverSettingTab(this.app, this));
   }
 
@@ -175,9 +166,87 @@ export default class ThreadsSaverPlugin extends Plugin {
       return;
     }
 
-    new Notice(`Found ${urls.length} Threads URL(s). Processing...`);
-    for (const url of urls) {
-      await this.processAndSaveUrl(url);
+    const progressNotice = new Notice(
+      `Processing Threads links: 0/${urls.length}`,
+      0
+    );
+    const processedFiles = new Map<string, TFile>();
+    const failedUrls: string[] = [];
+
+    try {
+      for (let index = 0; index < urls.length; index++) {
+        const url = urls[index];
+        progressNotice.setMessage(
+          `Processing Threads links: ${index + 1}/${urls.length}`
+        );
+
+        const savedFile = await this.processAndSaveUrl(url, {
+          openFile: false,
+          showNotices: false,
+        });
+
+        if (savedFile) {
+          processedFiles.set(url, savedFile);
+        } else {
+          failedUrls.push(url);
+        }
+      }
+
+      if (processedFiles.size > 0) {
+        await this.app.vault.process(activeFile, (latestContent) => {
+          let updatedContent = latestContent;
+
+          for (const [url, savedFile] of processedFiles) {
+            const noteLink = this.app.fileManager.generateMarkdownLink(
+              savedFile,
+              activeFile.path
+            );
+            const markdownLinkPattern = new RegExp(
+              `\\[([^\\]\\n]+)\\]\\(${escapeRegExp(url)}\\)`,
+              "g"
+            );
+
+            updatedContent = updatedContent.replace(
+              markdownLinkPattern,
+              (_match, alias: string) =>
+                this.app.fileManager.generateMarkdownLink(
+                  savedFile,
+                  activeFile.path,
+                  undefined,
+                  alias
+                )
+            );
+            updatedContent = updatedContent
+              .split(`<${url}>`)
+              .join(noteLink);
+            updatedContent = updatedContent.split(url).join(noteLink);
+          }
+
+          return updatedContent;
+        });
+      }
+    } catch (err) {
+      console.error("Bulk Threads processing stopped:", err);
+      new Notice(
+        "Bulk processing stopped before the active note could be fully updated.",
+        8000
+      );
+      return;
+    } finally {
+      progressNotice.hide();
+    }
+
+    const processedCount = processedFiles.size;
+    const failedCount = failedUrls.length;
+    const summary =
+      failedCount === 0
+        ? `Processed ${processedCount} Threads link(s).`
+        : `Processed ${processedCount} Threads link(s); ${failedCount} failed and remained unchanged.`;
+
+    new Notice(summary, 8000);
+
+    if (failedCount > 0) {
+      console.error("Failed bulk Threads URLs:", failedUrls);
     }
   }
 
@@ -221,60 +290,37 @@ export default class ThreadsSaverPlugin extends Plugin {
   /**
    * Fetches Threads post and saves to vault as a NEW note.
    */
-  async processAndSaveUrl(url: string): Promise<TFile | null> {
-    new Notice("Fetching Threads post details...");
+  async processAndSaveUrl(
+    url: string,
+    options: ProcessAndSaveOptions = {}
+  ): Promise<TFile | null> {
+    const { openFile = true, showNotices = true } = options;
+    if (showNotices) {
+      new Notice("Fetching Threads post details...");
+    }
+
     try {
       const post = await parseThreadsPost(url, this.settings.sessionCookie, this.settings.customUserAgent);
-      const savedFile = await saveThreadsPostToVault(this.app, post, this.settings);
+      const savedFile = await saveThreadsPostToVault(
+        this.app,
+        post,
+        this.settings,
+        { showNotice: showNotices }
+      );
       this.lastProcessedClipboardUrl = url;
 
-      // Open the newly created note in active leaf
-      const leaf = this.app.workspace.getUnpackagedLeaf ? this.app.workspace.getUnpackagedLeaf() : this.app.workspace.getLeaf(false);
-      await leaf.openFile(savedFile);
+      if (openFile) {
+        const leaf = this.app.workspace.getLeaf(false);
+        await leaf.openFile(savedFile);
+      }
+
       return savedFile;
     } catch (err: any) {
       console.error("Error processing Threads URL:", err);
-      new Notice(`Failed to save Threads post: ${err.message || err}`);
-      return null;
-    }
-  }
-
-  /**
-   * Checks if a file contains a raw Threads URL line (e.g. from Mobile Share Sheet),
-   * saves it as a NEW separate note in Threads folder, and cleans up temp share file.
-   */
-  private async checkAndEnrichShareSheetFile(file: TFile) {
-    if (this.processingFiles.has(file.path)) return;
-    try {
-      const content = await this.app.vault.read(file);
-      const urls = extractAllThreadsUrls(content);
-      if (urls.length === 0) return;
-
-      const lines = content.split("\n");
-      const isTempShareFile = lines.length <= 3 && urls.length >= 1;
-
-      if (isTempShareFile || content.trim() === urls[0]) {
-        this.processingFiles.add(file.path);
-        new Notice("Enriching shared Threads post link into new note...");
-        
-        const post = await parseThreadsPost(urls[0], this.settings.sessionCookie, this.settings.customUserAgent);
-        
-        // 1. Create a NEW formatted note in Threads/ folder
-        const newFile = await saveThreadsPostToVault(this.app, post, this.settings);
-        
-        // 2. Open the new note
-        const leaf = this.app.workspace.getUnpackagedLeaf ? this.app.workspace.getUnpackagedLeaf() : this.app.workspace.getLeaf(false);
-        await leaf.openFile(newFile);
-
-        // 3. Delete temporary share file if created by mobile share sheet
-        if (file.path !== newFile.path && !file.path.startsWith(this.settings.notesFolder)) {
-          await this.app.vault.delete(file);
-        }
-
-        this.processingFiles.delete(file.path);
+      if (showNotices) {
+        new Notice(`Failed to save Threads post: ${err.message || err}`);
       }
-    } catch {
-      this.processingFiles.delete(file.path);
+      return null;
     }
   }
 

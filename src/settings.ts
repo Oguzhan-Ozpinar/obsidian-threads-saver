@@ -90,18 +90,6 @@ export class ThreadsSaverSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Auto-Enrich Share Sheet Links")
-      .setDesc("Automatically convert raw Threads URLs shared via mobile Share Sheet into rich Markdown notes.")
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.autoEnrichShareSheetLinks)
-          .onChange(async (value) => {
-            this.plugin.settings.autoEnrichShareSheetLinks = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
       .setName("Notes Folder")
       .setDesc("Vault folder where saved Threads posts will be created as Markdown notes.")
       .addText((text) =>

@@ -2,7 +2,7 @@
 
 **Threads Saver** is a mobile-first Obsidian community plugin that saves Instagram Threads (`threads.net` & `threads.com`) posts into formatted Markdown notes inside your Obsidian vault.
 
-It works seamlessly on **iOS**, **Android**, and **Desktop**, allowing you to archive Threads posts, unroll full thread reply chains, download local image attachments, render visual UI cards, and customize note templates.
+It supports **iOS**, **Android**, and **Desktop**, allowing you to archive Threads posts, unroll full thread reply chains, download local image attachments, render visual UI cards, and customize note templates. The mobile capture flow differs by platform; see [Mobile Usage](#-mobile-usage) below.
 
 ---
 
@@ -35,15 +35,38 @@ It works seamlessly on **iOS**, **Android**, and **Desktop**, allowing you to ar
 * Copy a Threads link in the Threads app and switch to Obsidian.
 * A Toast notification will pop up: `📌 Threads link detected in clipboard! [ Save to Vault ]`. Click **Save** to create the note instantly.
 
-### 5. 🖼 Media Options & Local Archiving
+### 5. 📥 Bulk Inbox Processing
+* Collect multiple Threads links in a single Obsidian note throughout the day.
+* Run **Process All Threads Links in Active Note** to save every unique link as a formatted Threads note.
+* The source note stays open, successfully processed URLs become internal links, and failed URLs remain unchanged for retrying.
+
+### 6. 🖼 Media Options & Local Archiving
 * Toggle **Include Media** ON or OFF in settings.
 * Downloads post images directly into your vault's `attachments/threads` folder so image links never break when Instagram CDN links expire.
 
-### 6. 📱 Mobile Share Sheet & iOS Shortcuts
-* Automatically enriches raw Threads URLs shared via mobile Share Sheet into rich Markdown notes.
+### 7. 📱 iOS Shortcuts & Obsidian Deep Links
+* On iOS, a Shortcut can receive a Threads URL from the Share Sheet and pass it directly to Threads Saver.
 * Native integration with Obsidian's deep linking protocol:
   `obsidian://threads-saver?url=https://www.threads.com/@user/post/POST_ID`
 * Step-by-step [iOS Shortcut Setup Guide](docs/IOS_SHORTCUT.md).
+
+---
+
+## 📱 Mobile Usage
+
+### Android
+
+The recommended Android workflow is:
+
+1. Copy a Threads post link.
+2. Switch to Obsidian.
+3. Tap **Save to Vault** in the clipboard detection notice.
+
+Sharing directly to the Obsidian app opens Obsidian's own Android share dialog first. Community plugins cannot intercept or bypass that native dialog, so Threads Saver does not offer a direct Android Share Sheet capture flow.
+
+### iOS and iPadOS
+
+Use the provided [iOS Shortcut Setup Guide](docs/IOS_SHORTCUT.md). The Shortcut receives the shared Threads URL and opens the Threads Saver deep link. Obsidian then opens, fetches the post, and creates the formatted note. No intermediate note-selection screen is required.
 
 ---
 
@@ -65,7 +88,6 @@ It works seamlessly on **iOS**, **Android**, and **Desktop**, allowing you to ar
 | **Include Media** | Include post images in saved notes. | `ON` |
 | **Download Media Locally** | Download images into local vault attachments. | `ON` |
 | **Clipboard Auto-Detect** | Show toast notice on app focus when Threads URL is copied. | `ON` |
-| **Auto-Enrich Share Sheet Links** | Convert shared URLs into rich notes. | `ON` |
 | **Note Title Template** | Template for note filenames. | `Threads - {{author_username}} - {{id}}` |
 | **Custom Note Body Template** | Custom layout for note body & frontmatter. | Configurable |
 

@@ -1,6 +1,6 @@
 # 📱 iOS Kestirmesi (Shortcut) Rehberi
 
-**Threads Saver**, iOS Shortcuts (Kestirmeler) ile %100 entegre çalışır. Threads uygulamasında herhangi bir post altındaki **Paylaş** butonuna basıp **Threads Saver** seçtiğinizde, Obsidian açılır ve notunuzu anında arka planda oluşturur.
+**Threads Saver**, iOS Shortcuts (Kestirmeler) üzerinden paylaşılan Threads bağlantılarını kabul eder. Threads uygulamasında bir gönderinin altındaki **Paylaş** butonuna basıp **Threads Saver** kestirmesini seçtiğinizde Obsidian açılır; eklenti gönderiyi getirip biçimlendirilmiş notu oluşturur.
 
 ---
 
@@ -25,4 +25,7 @@
 1. **Threads** uygulamasında kaydetmek istediğiniz herhangi bir gönderiyi açın.
 2. Gönderinin altındaki **Paylaş (Share)** butonuna basın.
 3. Açılan iOS paylaşım sayfasında **Threads Saver** kestirmesini seçin.
-4. Obsidian otomatik açılacak ve notunuz zengin içerikle kaydedilecektir!
+4. Obsidian açılacak; Threads Saver bağlantıyı işleyerek notunuzu zengin içerikle kaydedecektir.
+
+> [!NOTE]
+> Bu akış iOS/iPadOS Kestirmeler uygulamasına özeldir. Android'de doğrudan Obsidian'a paylaşım, önce Obsidian'ın kendi not seçme/ekleme ekranını açar ve bir topluluk eklentisi bu ekranı atlayamaz.

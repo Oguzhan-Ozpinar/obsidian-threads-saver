@@ -57,7 +57,6 @@ var DEFAULT_SETTINGS = {
   downloadMediaLocally: true,
   includeMedia: true,
   clipboardAutoDetect: true,
-  autoEnrichShareSheetLinks: true,
   unrollThreadChain: true,
   useVisualCard: false,
   noteTitleTemplate: "Threads - {{author_username}} - {{id}}",
@@ -111,12 +110,6 @@ var ThreadsSaverSettingTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("Clipboard Auto-Detect").setDesc("Show a quick Toast notification to save Threads link when switching back to Obsidian with a Threads URL in clipboard.").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.clipboardAutoDetect).onChange(async (value) => {
         this.plugin.settings.clipboardAutoDetect = value;
-        await this.plugin.saveSettings();
-      })
-    );
-    new import_obsidian.Setting(containerEl).setName("Auto-Enrich Share Sheet Links").setDesc("Automatically convert raw Threads URLs shared via mobile Share Sheet into rich Markdown notes.").addToggle(
-      (toggle) => toggle.setValue(this.plugin.settings.autoEnrichShareSheetLinks).onChange(async (value) => {
-        this.plugin.settings.autoEnrichShareSheetLinks = value;
         await this.plugin.saveSettings();
       })
     );
@@ -177,9 +170,6 @@ function extractThreadsPostId(url) {
     console.error("Error extracting Threads post ID:", err);
     return null;
   }
-}
-function isThreadsUrl(url) {
-  return /https?:\/\/(www\.)?threads\.(net|com)\/(@[a-zA-Z0-9_.-]+\/post\/[a-zA-Z0-9_.-]+|t\/[a-zA-Z0-9_.-]+|share\/[a-zA-Z0-9_.-]+)/i.test(url.trim());
 }
 function getImageKey(url) {
   try {
@@ -533,26 +523,38 @@ async function generateThreadsNoteContent(app, post, settings) {
     content: cleanedContent
   };
 }
-async function saveThreadsPostToVault(app, post, settings) {
+async function saveThreadsPostToVault(app, post, settings, options = {}) {
+  const { showNotice = true } = options;
   await ensureFolderExists(app, settings.notesFolder);
   const { title, content } = await generateThreadsNoteContent(app, post, settings);
   const filePath = (0, import_obsidian3.normalizePath)(`${settings.notesFolder}/${title}.md`);
   const existingFile = app.vault.getAbstractFileByPath(filePath);
   if (existingFile instanceof import_obsidian3.TFile) {
     await app.vault.modify(existingFile, content);
-    new import_obsidian3.Notice(`Updated Threads note: ${title}`);
+    if (showNotice) {
+      new import_obsidian3.Notice(`Updated Threads note: ${title}`);
+    }
     return existingFile;
   } else {
     const newFile = await app.vault.create(filePath, content);
-    new import_obsidian3.Notice(`Saved Threads note: ${title}`);
+    if (showNotice) {
+      new import_obsidian3.Notice(`Saved Threads note: ${title}`);
+    }
     return newFile;
   }
 }
 
 // src/main.ts
 function extractAllThreadsUrls(text) {
-  const matches = text.match(/https?:\/\/(www\.)?threads\.(net|com)\/(@[a-zA-Z0-9_.-]+\/post\/[a-zA-Z0-9_.-]+|t\/[a-zA-Z0-9_.-]+|share\/[a-zA-Z0-9_.-]+)/gi);
-  return matches ? Array.from(new Set(matches.map((m) => m.trim()))) : [];
+  const matches = text.match(
+    /https?:\/\/(www\.)?threads\.(net|com)\/(@[a-zA-Z0-9_.-]+\/post\/[a-zA-Z0-9_.-]+|t\/[a-zA-Z0-9_.-]+|share\/[a-zA-Z0-9_.-]+)(?:[/?#][^\s<>"'`)\]}]*)?/gi
+  );
+  return matches ? Array.from(
+    new Set(matches.map((match) => match.replace(/[.,;:!?]+$/g, "")))
+  ) : [];
+}
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
   constructor() {
@@ -560,7 +562,6 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
     this.settings = DEFAULT_SETTINGS;
     this.focusListener = null;
     this.lastProcessedClipboardUrl = "";
-    this.processingFiles = /* @__PURE__ */ new Set();
   }
   async onload() {
     console.log("Loading Threads Saver Plugin");
@@ -580,7 +581,7 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
     });
     this.addCommand({
       id: "threads-convert-links-in-active-note",
-      name: "Convert Threads Links in Active Note",
+      name: "Process All Threads Links in Active Note",
       callback: () => this.handleConvertActiveNoteLinks()
     });
     this.registerEvent(
@@ -600,43 +601,20 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
     );
     this.registerObsidianProtocolHandler("threads-saver", async (params) => {
       if (params.url) {
-        new import_obsidian4.Notice("Processing Threads URL from share...");
+        new import_obsidian4.Notice("Processing Threads URL from deep link...");
         await this.processAndSaveUrl(params.url);
       }
     });
-    this.registerEvent(
-      this.app.vault.on("create", async (file) => {
-        if (!this.settings.autoEnrichShareSheetLinks)
-          return;
-        if (file instanceof import_obsidian4.TFile && file.extension === "md") {
-          setTimeout(async () => {
-            await this.checkAndEnrichShareSheetFile(file);
-          }, 400);
-        }
-      })
-    );
-    this.registerEvent(
-      this.app.vault.on("modify", async (file) => {
-        if (!this.settings.autoEnrichShareSheetLinks)
-          return;
-        if (file instanceof import_obsidian4.TFile && file.extension === "md") {
-          if (this.processingFiles.has(file.path))
-            return;
-          setTimeout(async () => {
-            await this.checkAndEnrichShareSheetFile(file);
-          }, 600);
-        }
-      })
-    );
     this.focusListener = async () => {
       if (!this.settings.clipboardAutoDetect)
         return;
       try {
         if (navigator.clipboard && navigator.clipboard.readText) {
           const text = await navigator.clipboard.readText();
-          const trimmed = text.trim();
-          if (isThreadsUrl(trimmed) && trimmed !== this.lastProcessedClipboardUrl) {
-            this.showClipboardNotice(trimmed);
+          const urls = extractAllThreadsUrls(text);
+          const url = urls[0];
+          if (url && url !== this.lastProcessedClipboardUrl) {
+            this.showClipboardNotice(url);
           }
         }
       } catch {
@@ -690,9 +668,71 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
       new import_obsidian4.Notice("No raw Threads URLs found in active note.");
       return;
     }
-    new import_obsidian4.Notice(`Found ${urls.length} Threads URL(s). Processing...`);
-    for (const url of urls) {
-      await this.processAndSaveUrl(url);
+    const progressNotice = new import_obsidian4.Notice(
+      `Processing Threads links: 0/${urls.length}`,
+      0
+    );
+    const processedFiles = /* @__PURE__ */ new Map();
+    const failedUrls = [];
+    try {
+      for (let index = 0; index < urls.length; index++) {
+        const url = urls[index];
+        progressNotice.setMessage(
+          `Processing Threads links: ${index + 1}/${urls.length}`
+        );
+        const savedFile = await this.processAndSaveUrl(url, {
+          openFile: false,
+          showNotices: false
+        });
+        if (savedFile) {
+          processedFiles.set(url, savedFile);
+        } else {
+          failedUrls.push(url);
+        }
+      }
+      if (processedFiles.size > 0) {
+        await this.app.vault.process(activeFile, (latestContent) => {
+          let updatedContent = latestContent;
+          for (const [url, savedFile] of processedFiles) {
+            const noteLink = this.app.fileManager.generateMarkdownLink(
+              savedFile,
+              activeFile.path
+            );
+            const markdownLinkPattern = new RegExp(
+              `\\[([^\\]\\n]+)\\]\\(${escapeRegExp(url)}\\)`,
+              "g"
+            );
+            updatedContent = updatedContent.replace(
+              markdownLinkPattern,
+              (_match, alias) => this.app.fileManager.generateMarkdownLink(
+                savedFile,
+                activeFile.path,
+                void 0,
+                alias
+              )
+            );
+            updatedContent = updatedContent.split(`<${url}>`).join(noteLink);
+            updatedContent = updatedContent.split(url).join(noteLink);
+          }
+          return updatedContent;
+        });
+      }
+    } catch (err) {
+      console.error("Bulk Threads processing stopped:", err);
+      new import_obsidian4.Notice(
+        "Bulk processing stopped before the active note could be fully updated.",
+        8e3
+      );
+      return;
+    } finally {
+      progressNotice.hide();
+    }
+    const processedCount = processedFiles.size;
+    const failedCount = failedUrls.length;
+    const summary = failedCount === 0 ? `Processed ${processedCount} Threads link(s).` : `Processed ${processedCount} Threads link(s); ${failedCount} failed and remained unchanged.`;
+    new import_obsidian4.Notice(summary, 8e3);
+    if (failedCount > 0) {
+      console.error("Failed bulk Threads URLs:", failedUrls);
     }
   }
   /**
@@ -735,49 +775,31 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
   /**
    * Fetches Threads post and saves to vault as a NEW note.
    */
-  async processAndSaveUrl(url) {
-    new import_obsidian4.Notice("Fetching Threads post details...");
+  async processAndSaveUrl(url, options = {}) {
+    const { openFile = true, showNotices = true } = options;
+    if (showNotices) {
+      new import_obsidian4.Notice("Fetching Threads post details...");
+    }
     try {
       const post = await parseThreadsPost(url, this.settings.sessionCookie, this.settings.customUserAgent);
-      const savedFile = await saveThreadsPostToVault(this.app, post, this.settings);
+      const savedFile = await saveThreadsPostToVault(
+        this.app,
+        post,
+        this.settings,
+        { showNotice: showNotices }
+      );
       this.lastProcessedClipboardUrl = url;
-      const leaf = this.app.workspace.getUnpackagedLeaf ? this.app.workspace.getUnpackagedLeaf() : this.app.workspace.getLeaf(false);
-      await leaf.openFile(savedFile);
+      if (openFile) {
+        const leaf = this.app.workspace.getLeaf(false);
+        await leaf.openFile(savedFile);
+      }
       return savedFile;
     } catch (err) {
       console.error("Error processing Threads URL:", err);
-      new import_obsidian4.Notice(`Failed to save Threads post: ${err.message || err}`);
-      return null;
-    }
-  }
-  /**
-   * Checks if a file contains a raw Threads URL line (e.g. from Mobile Share Sheet),
-   * saves it as a NEW separate note in Threads folder, and cleans up temp share file.
-   */
-  async checkAndEnrichShareSheetFile(file) {
-    if (this.processingFiles.has(file.path))
-      return;
-    try {
-      const content = await this.app.vault.read(file);
-      const urls = extractAllThreadsUrls(content);
-      if (urls.length === 0)
-        return;
-      const lines = content.split("\n");
-      const isTempShareFile = lines.length <= 3 && urls.length >= 1;
-      if (isTempShareFile || content.trim() === urls[0]) {
-        this.processingFiles.add(file.path);
-        new import_obsidian4.Notice("Enriching shared Threads post link into new note...");
-        const post = await parseThreadsPost(urls[0], this.settings.sessionCookie, this.settings.customUserAgent);
-        const newFile = await saveThreadsPostToVault(this.app, post, this.settings);
-        const leaf = this.app.workspace.getUnpackagedLeaf ? this.app.workspace.getUnpackagedLeaf() : this.app.workspace.getLeaf(false);
-        await leaf.openFile(newFile);
-        if (file.path !== newFile.path && !file.path.startsWith(this.settings.notesFolder)) {
-          await this.app.vault.delete(file);
-        }
-        this.processingFiles.delete(file.path);
+      if (showNotices) {
+        new import_obsidian4.Notice(`Failed to save Threads post: ${err.message || err}`);
       }
-    } catch {
-      this.processingFiles.delete(file.path);
+      return null;
     }
   }
   /**

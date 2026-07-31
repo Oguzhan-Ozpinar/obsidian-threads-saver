@@ -247,8 +247,10 @@ export async function generateThreadsNoteContent(
 export async function saveThreadsPostToVault(
   app: App,
   post: ThreadsPost,
-  settings: PluginSettings
+  settings: PluginSettings,
+  options: { showNotice?: boolean } = {}
 ): Promise<TFile> {
+  const { showNotice = true } = options;
   await ensureFolderExists(app, settings.notesFolder);
 
   const { title, content } = await generateThreadsNoteContent(app, post, settings);
@@ -257,11 +259,15 @@ export async function saveThreadsPostToVault(
   const existingFile = app.vault.getAbstractFileByPath(filePath);
   if (existingFile instanceof TFile) {
     await app.vault.modify(existingFile, content);
-    new Notice(`Updated Threads note: ${title}`);
+    if (showNotice) {
+      new Notice(`Updated Threads note: ${title}`);
+    }
     return existingFile;
   } else {
     const newFile = await app.vault.create(filePath, content);
-    new Notice(`Saved Threads note: ${title}`);
+    if (showNotice) {
+      new Notice(`Saved Threads note: ${title}`);
+    }
     return newFile;
   }
 }
