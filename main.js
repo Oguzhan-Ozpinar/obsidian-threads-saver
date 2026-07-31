@@ -733,7 +733,7 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
     }
   }
   /**
-   * Fetches Threads post and saves to vault.
+   * Fetches Threads post and saves to vault as a NEW note.
    */
   async processAndSaveUrl(url) {
     new import_obsidian4.Notice("Fetching Threads post details...");
@@ -751,7 +751,8 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
     }
   }
   /**
-   * Checks if a file contains a raw Threads URL line (e.g. from Mobile Share Sheet) and auto-enriches it.
+   * Checks if a file contains a raw Threads URL line (e.g. from Mobile Share Sheet),
+   * saves it as a NEW separate note in Threads folder, and cleans up temp share file.
    */
   async checkAndEnrichShareSheetFile(file) {
     if (this.processingFiles.has(file.path))
@@ -762,19 +763,16 @@ var ThreadsSaverPlugin = class extends import_obsidian4.Plugin {
       if (urls.length === 0)
         return;
       const lines = content.split("\n");
-      const hasStandaloneLink = lines.some((l) => {
-        const trimmed = l.trim().replace(/^\[|\]\(https?:\/\/[^)]+\)$/g, "");
-        return urls.includes(trimmed) || isThreadsUrl(trimmed);
-      });
-      if (hasStandaloneLink || content.trim() === urls[0]) {
+      const isTempShareFile = lines.length <= 3 && urls.length >= 1;
+      if (isTempShareFile || content.trim() === urls[0]) {
         this.processingFiles.add(file.path);
-        new import_obsidian4.Notice("Enriching shared Threads post link...");
+        new import_obsidian4.Notice("Enriching shared Threads post link into new note...");
         const post = await parseThreadsPost(urls[0], this.settings.sessionCookie, this.settings.customUserAgent);
-        if (content.trim() === urls[0] || lines.length <= 2) {
-          const { content: enrichedContent } = await generateThreadsNoteContent(this.app, post, this.settings);
-          await this.app.vault.modify(file, enrichedContent);
-        } else {
-          await saveThreadsPostToVault(this.app, post, this.settings);
+        const newFile = await saveThreadsPostToVault(this.app, post, this.settings);
+        const leaf = this.app.workspace.getUnpackagedLeaf ? this.app.workspace.getUnpackagedLeaf() : this.app.workspace.getLeaf(false);
+        await leaf.openFile(newFile);
+        if (file.path !== newFile.path && !file.path.startsWith(this.settings.notesFolder)) {
+          await this.app.vault.delete(file);
         }
         this.processingFiles.delete(file.path);
       }

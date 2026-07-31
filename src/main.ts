@@ -219,7 +219,7 @@ export default class ThreadsSaverPlugin extends Plugin {
   }
 
   /**
-   * Fetches Threads post and saves to vault.
+   * Fetches Threads post and saves to vault as a NEW note.
    */
   async processAndSaveUrl(url: string): Promise<TFile | null> {
     new Notice("Fetching Threads post details...");
@@ -240,7 +240,8 @@ export default class ThreadsSaverPlugin extends Plugin {
   }
 
   /**
-   * Checks if a file contains a raw Threads URL line (e.g. from Mobile Share Sheet) and auto-enriches it.
+   * Checks if a file contains a raw Threads URL line (e.g. from Mobile Share Sheet),
+   * saves it as a NEW separate note in Threads folder, and cleans up temp share file.
    */
   private async checkAndEnrichShareSheetFile(file: TFile) {
     if (this.processingFiles.has(file.path)) return;
@@ -249,26 +250,27 @@ export default class ThreadsSaverPlugin extends Plugin {
       const urls = extractAllThreadsUrls(content);
       if (urls.length === 0) return;
 
-      // Check if file contains a standalone raw Threads link line
       const lines = content.split("\n");
-      const hasStandaloneLink = lines.some((l) => {
-        const trimmed = l.trim().replace(/^\[|\]\(https?:\/\/[^)]+\)$/g, "");
-        return urls.includes(trimmed) || isThreadsUrl(trimmed);
-      });
+      const isTempShareFile = lines.length <= 3 && urls.length >= 1;
 
-      if (hasStandaloneLink || content.trim() === urls[0]) {
+      if (isTempShareFile || content.trim() === urls[0]) {
         this.processingFiles.add(file.path);
-        new Notice("Enriching shared Threads post link...");
+        new Notice("Enriching shared Threads post link into new note...");
+        
         const post = await parseThreadsPost(urls[0], this.settings.sessionCookie, this.settings.customUserAgent);
         
-        // If file contains only the raw URL, replace note content directly
-        if (content.trim() === urls[0] || lines.length <= 2) {
-          const { content: enrichedContent } = await generateThreadsNoteContent(this.app, post, this.settings);
-          await this.app.vault.modify(file, enrichedContent);
-        } else {
-          // Otherwise save as standalone Threads note
-          await saveThreadsPostToVault(this.app, post, this.settings);
+        // 1. Create a NEW formatted note in Threads/ folder
+        const newFile = await saveThreadsPostToVault(this.app, post, this.settings);
+        
+        // 2. Open the new note
+        const leaf = this.app.workspace.getUnpackagedLeaf ? this.app.workspace.getUnpackagedLeaf() : this.app.workspace.getLeaf(false);
+        await leaf.openFile(newFile);
+
+        // 3. Delete temporary share file if created by mobile share sheet
+        if (file.path !== newFile.path && !file.path.startsWith(this.settings.notesFolder)) {
+          await this.app.vault.delete(file);
         }
+
         this.processingFiles.delete(file.path);
       }
     } catch {
